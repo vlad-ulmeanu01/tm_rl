@@ -38,18 +38,3 @@ def write_processed_output(fName: str, sol, GAP_TIME):
         fout.write(str(i * GAP_TIME) + " steer " + str(steer[i]) + "\n")
 
     fout.close()
-
-"""
-C:/Users/ulmea/Documents/GitHub/tm_nn/MakeRefined/export_pts.txt
-incarca punctele folosite ca referinta in trecerea de la unrefined la refined pentru variabilele x/y/z0..20,
-timeSinceLastBrake, timeSpentBraking, timeSinceLastAir, timeSpentAir.
-o linie arata tip: "x0 11 -1120452.748 -896362.198 -672271.649 -448181.099 -224090.55 0.0 224090.55 448181.099 672271.649 896362.198 1120452.748"
-"""
-def load_export_points(fName: str) -> dict:
-    fin = open(fName)
-    ht = {}
-    for line in fin.readlines():
-        if len(line):
-            parts = line.split()
-            ht[parts[0]] = list(map(float, parts[1:])) #2: inainte. nu mai am lungimea trecuta acum.
-    return ht

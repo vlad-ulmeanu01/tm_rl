@@ -6,7 +6,6 @@ import signal
 import copy
 import time
 import sys
-import os
 
 import worker
 import sim_utils
@@ -91,9 +90,10 @@ class MainClient(Client):
                 self.worker.tmp_did_finish_track = True
                 print(f"did finish track!")
 
-            outName = f"{self.processed_output_dir}{str(time.time()).replace('.', '')}_{self.last_time_in_sim_step}.txt"
-            sim_utils.write_processed_output(outName, self.worker.input_stack[self.worker.input_stack_index][0], self.GAP_TIME)
-            print(f"wrote to {outName}!")
+                # ! acum scriu doar daca am terminat traseul. daca nu vrei, muta in afara if-ului.
+                outName = f"{self.processed_output_dir}{str(time.time()).replace('.', '')}_{self.last_time_in_sim_step}.txt"
+                sim_utils.write_processed_output(outName, self.worker.input_stack[self.worker.input_stack_index][0], self.GAP_TIME)
+                print(f"wrote to {outName}!")
 
             self.worker.process_input_stack(iface)
 
@@ -167,4 +167,6 @@ def main():
         time.sleep(0)
 
 if __name__ == '__main__':
+    # main client -> worker -> oracle
+    #                                  -> worker -> main client.
     main()

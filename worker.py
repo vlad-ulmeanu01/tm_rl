@@ -1,7 +1,7 @@
 from tminterface.interface import TMInterface
 import copy
 
-import oracle
+import oracle_qlearn
 
 class Worker():
     def __init__(self):
@@ -16,7 +16,7 @@ class Worker():
         self.input_array = ([0], [1], [0]) #steer, gas, brake.
 
         #comunicare cu oracolul.
-        self.oracle = oracle.Oracle()
+        self.oracle = oracle_qlearn.Oracle()
 
         #deocamdata sunt multumit cu orice care termina traseul.
         self.tmp_did_finish_track = False
