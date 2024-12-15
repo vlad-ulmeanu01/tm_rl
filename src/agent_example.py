@@ -13,7 +13,6 @@ class Agent:
 
         self.want_new_episode() # call want_new_episode() immediately here.
 
-
     """
     Signal to the client that we want to begin a new episode. We may call this in the other two functions if we:
     * finished an episode by completing the map.
@@ -34,7 +33,7 @@ class Agent:
         self.states.append([(state[utils.IND_X], state[utils.IND_Y], state[utils.IND_Z])])
 
         is_state_too_bad = False #e.g. too far from other racing lines or too much time has passed <=> self.states array length is too big.
-        if len(self.states) * utils.GAP_TIME >= utils.MAX_TIMESTEPS:
+        if len(self.states) * utils.GAP_TIME >= utils.MAX_TIME:
             is_state_too_bad = True
 
         if is_state_too_bad:

@@ -8,7 +8,7 @@ import copy
 import time
 import sys
 
-import agent_example
+import agent_qlearning
 import utils
 
 
@@ -16,7 +16,7 @@ class MainClient(Client):
     def __init__(self):
         super().__init__()
 
-        self.agent = agent_example.Agent()
+        self.agent = agent_qlearning.Agent()
         self.remembered_state = None
 
     def on_registered(self, iface: TMInterface):
