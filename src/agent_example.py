@@ -30,11 +30,15 @@ class Agent:
     * called want_new_episode().
     * responded to send_action(), and now we got the resulting next state.
     """
-    def receive_new_state(self, state: list):
+    def receive_new_state(self, state: tuple):
         self.states.append([(state[utils.IND_X], state[utils.IND_Y], state[utils.IND_Z])])
 
         is_state_too_bad = False #e.g. too far from other racing lines or too much time has passed <=> self.states array length is too big.
+        if len(self.states) * utils.GAP_TIME >= utils.MAX_TIMESTEPS:
+            is_state_too_bad = True
+
         if is_state_too_bad:
+            print(f"Episode too bad.")
             self.want_new_episode()
 
 
@@ -44,7 +48,7 @@ class Agent:
     def episode_ended(self):
         # ! in-time game is actually (len(self.states) - 1) * utils.GAP_TIME.
         utils.write_processed_output(
-            fname = f"{utils.PROCESSED_OUTPUT_DIR_PREFIX}{str(time.time()).replace('.', '')}_{len(self.states) * utils.GAP_TIME}.txt",
+            fname = f"{utils.PROCESSED_OUTPUT_DIR_PREFIX}{str(time.time()).replace('.', '')}_{(len(self.states) - 1) * utils.GAP_TIME}.txt",
             actions = self.actions
         )
 

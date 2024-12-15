@@ -1,13 +1,15 @@
 import typing
 
 
-GAP_TIME = 10 #ms, lungimea unui cadru.
+GAP_TIME = 10 # ms, length of one timestep.
+MAX_TIMESTEPS = 3750 # maximum number of timesteps we're willing to run a replay for. 100 timesteps per second.
+PROCESSED_OUTPUT_DIR_PREFIX = "../processed_outputs/output_"
+
 IND_STEER, IND_GAS, IND_BRAKE = 0, 1, 2
 VAL_STEER_LEFT, VAL_NO_STEER, VAL_STEER_RIGHT = -65536, 0, 65536
 VAL_NO_GAS, VAL_GAS = 0, 1
 VAL_NO_BRAKE, VAL_BRAKE = 0, 1
 IND_X, IND_Y, IND_Z, IND_YAW, IND_PITCH, IND_ROLL, IND_VX, IND_VY, IND_VZ, IND_WHEEL_MATERIALS, IND_WHEEL_CONTACT = range(11)
-PROCESSED_OUTPUT_DIR_PREFIX = "../processed_outputs/output_"
 
 """
 Reads an input file. First line steer, second gas, third brake.
