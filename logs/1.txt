@@ -1,0 +1,22 @@
+Q e prea mare.. probabil gamma e prea mic.
+r = -1.
+r * (g**0 + g**1 + g**2 + ..) = r * 1 / (1 - gamma).
+
+1 / (1 - gamma) = 20..
+deci vede cam 20 de pasi in viitor.
+
+trebuie 0.99 / 0.995 / ...
+
+33.666 s, self.episode_ind = 25, max(Q(s[0], a) | a) = -118.31598663330078.        
+59.999 s, self.episode_ind = 50, max(Q(s[0], a) | a) = -57.381961822509766.        
+86.017 s, self.episode_ind = 75, max(Q(s[0], a) | a) = -32.585121154785156.        
+110.604 s, self.episode_ind = 100, max(Q(s[0], a) | a) = -25.335603713989258.      
+131.43 s, self.episode_ind = 125, max(Q(s[0], a) | a) = -22.19776725769043.        
+152.641 s, self.episode_ind = 150, max(Q(s[0], a) | a) = -20.93474006652832.
+172.844 s, self.episode_ind = 175, max(Q(s[0], a) | a) = -20.427074432373047.
+192.958 s, self.episode_ind = 200, max(Q(s[0], a) | a) = -20.17531394958496.
+213.094 s, self.episode_ind = 225, max(Q(s[0], a) | a) = -20.076915740966797.
+233.225 s, self.episode_ind = 250, max(Q(s[0], a) | a) = -20.00841522216797.
+253.343 s, self.episode_ind = 275, max(Q(s[0], a) | a) = -19.889223098754883.
+273.535 s, self.episode_ind = 300, max(Q(s[0], a) | a) = -19.842361450195312.
+293.569 s, self.episode_ind = 325, max(Q(s[0], a) | a) = -19.827795028686523.

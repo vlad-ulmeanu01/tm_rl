@@ -93,7 +93,6 @@ class Agent:
                 indexes = indexes.reshape(-1)
 
                 z = np.exp(- np.linalg.norm(self.replays_states_actions[indexes, :3] - self.states[-1], axis = 1) * self.REWARD_SPREAD_SQ_2X_INV)
-
                 r = -1 + self.REWARD_COEF * sum([z[j] for j in range(self.TOPK_CLOSEST) if all(self.replays_states_actions[j][3:] == a)]) / self.TOPK_CLOSEST
 
                 q = (1 - self.LR) * q + self.LR * (r + self.DISCOUNT_FACTOR * max(self.q_table[self.states[i+1]].values()))
