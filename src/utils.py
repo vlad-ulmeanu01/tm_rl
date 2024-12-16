@@ -19,8 +19,8 @@ VALUES_BRAKE = [VAL_NO_BRAKE, VAL_BRAKE]
 
 IND_X, IND_Y, IND_Z, IND_YAW, IND_PITCH, IND_ROLL, IND_VX, IND_VY, IND_VZ, IND_WHEEL_MATERIALS, IND_WHEEL_CONTACT = range(11)
 
-MAX_TIME = 10_000  # maximum number of milliseconds we're willing to run a replay for.
-REPLAYS_DIR = "C:\\Users\\ulmea\\Desktop\\Probleme\\Trackmania\\test_date_roti\\RawDataset\\ABC\\A-9"
+MAX_TIME = 15_000  # maximum number of milliseconds we're willing to run a replay for.
+REPLAYS_DIR = "C:\\Users\\ulmea\\Desktop\\Probleme\\Trackmania\\test_date_roti\\RawDataset\\ABC\\A-9_keyboard"
 
 
 """
