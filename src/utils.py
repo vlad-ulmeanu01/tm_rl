@@ -3,6 +3,8 @@ import typing
 
 GAP_TIME = 10 # ms, length of one timestep.
 PROCESSED_OUTPUT_DIR_PREFIX = "../processed_outputs/output_"
+PARTIAL_OUTPUT_DIR_PREFIX = "../qlearning_outputs/partial_"
+FIGURES_OUTPUT_DIR_PREFIX = "../figures/"
 
 IND_STEER, IND_GAS, IND_BRAKE = 0, 1, 2
 
@@ -35,8 +37,10 @@ def read_processed_input(fname: str):
 Writes processed actions in a file such that they may be read by TMInterface.
 The actions tuple is made out of three lists of equal size: steer, gas and brake actions.
 """
-def write_processed_output(fname: str, actions: typing.Tuple[typing.List, typing.List, typing.List]):
-    print(f"(write_processed_output) Will write to {fname = }.")
+def write_processed_output(fname: str, actions: typing.Tuple[typing.List, typing.List, typing.List], mention_write: bool):
+    if mention_write:
+        print(f"(write_processed_output) Will write to {fname = }.")
+
     with open(fname, "w") as fout:
         steer, gas, brake = actions[IND_STEER], actions[IND_GAS], actions[IND_BRAKE]
         assert(len(steer) == len(gas) and len(gas) == len(brake))

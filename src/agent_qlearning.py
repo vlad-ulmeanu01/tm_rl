@@ -1,4 +1,8 @@
+import matplotlib
+matplotlib.use("Agg")
+
 from sklearn.neighbors import KDTree
+import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 import random
@@ -25,7 +29,7 @@ class Agent:
         self.RATE_UPD = 1 - 1e-3
         self.LR = 0.9  # Q-learning rate. lr *= rate_upd after each episode.
         self.REWARD_COEF = 0.5  # r(s, a) = -1 + REWARD_COEF * f(s, a).
-        self.DISCOUNT_FACTOR = 0.95
+        self.DISCOUNT_FACTOR = 0.995
         self.EPSILON = 0.9  # epsilon greedy policy. eps *= rate_upd after each episode.
 
         self.REWARD_ON_FAIL = -int(utils.MAX_TIME // utils.GAP_TIME)  # the reward given when cancelling the episode.
@@ -53,6 +57,9 @@ class Agent:
         self.q_table = {}  # q_table[(x, y, z)] = [{(steer, gas, brake: best Q value}]
 
         self.dbg_tstart = time.time()
+        self.dbg_xlim = (self.replays_states_actions[:, 0].min() - 10, self.replays_states_actions[:, 0].max() + 10)
+        self.dbg_zlim = (self.replays_states_actions[:, 2].min() - 10, self.replays_states_actions[:, 2].max() + 10)
+
         print(f"agent_qlearning loaded.")
 
         self.want_new_episode()  # call want_new_episode() immediately here.
@@ -77,14 +84,14 @@ class Agent:
     def qlearn_update(self, did_episode_end_normally: bool):
         # assert len(self.states) == len(self.actions[0]) + 1, f"{self.episode_ind = }, {len(self.states) = } != {len(self.actions[0]) + 1 = }."
 
-        for i in range(len(self.actions) - 1, -1, -1):
+        for i in range(len(self.actions[0]) - 1, -1, -1):
             s, a = self.states[i], (self.actions[utils.IND_STEER][i], self.actions[utils.IND_GAS][i], self.actions[utils.IND_BRAKE][i])
             if s not in self.q_table:
                 self.q_table[s] = {}
 
             q = self.q_table[s].get(a, 0.0)  # the current Q(s, a).
 
-            if i + 1 == len(self.actions):
+            if i + 1 == len(self.actions[0]):
                 last_reward = 0 if did_episode_end_normally else self.REWARD_ON_FAIL  # all other rewards are -1 + REWARD_COEF * f(s,a).
                 q = (1 - self.LR) * q + self.LR * last_reward  # Q(s, a) <- (1 - lr) * Q(s, a) + lr * last_reward
             else:
@@ -104,7 +111,35 @@ class Agent:
         self.EPSILON *= self.RATE_UPD
 
         if self.episode_ind % self.dbg_every == 0:
+            print(f"debug: {len(self.q_table) = }.")
+
             print(f"{round(time.time() - self.dbg_tstart, 3)} s, {self.episode_ind = }, max(Q(s[0], a) | a) = {round(max(self.q_table[self.states[0]].values()), 3) if self.q_table[self.states[0]] else '??'}.")
+
+            utils.write_processed_output(
+                fname = f"{utils.PARTIAL_OUTPUT_DIR_PREFIX}{int(self.dbg_tstart)}_{self.episode_ind}.txt",
+                actions = self.actions,
+                mention_write = False
+            )
+
+            fig, ax = plt.subplots(1, 2, figsize = (12, 4))
+
+            ax[0].scatter(self.replays_states_actions[:, 0], self.replays_states_actions[:, 2], s = 1)
+            ax[0].set_title("Racing lines")
+
+            xs, zs = [x for x, y, z in self.q_table.keys()], [z for x, y, z in self.q_table.keys()]
+            best_qs = [max(action_q_ht.values()) for action_q_ht in self.q_table.values()]  # action_q_ht is a hashtable {action: best Q}.
+
+            sp = ax[1].scatter(xs, zs, c = best_qs, s = 10)
+            cbar = fig.colorbar(sp, ax = ax[1])
+            cbar.set_label("max(Q(s, a) | a)")
+
+            for i in range(2):
+                ax[i].set_xlabel('X'); ax[i].set_xlim(self.dbg_xlim)
+                ax[i].set_ylabel('Z'); ax[i].set_ylim(self.dbg_zlim)
+
+            fig.savefig(f"{utils.FIGURES_OUTPUT_DIR_PREFIX}fig_{int(self.dbg_tstart)}_{self.episode_ind}.png", bbox_inches = "tight")
+
+
 
 
     """
@@ -115,7 +150,8 @@ class Agent:
 
         utils.write_processed_output(
             fname = f"{utils.PROCESSED_OUTPUT_DIR_PREFIX}{str(time.time()).replace('.', '')}_{(len(self.states) - 1) * utils.GAP_TIME}.txt",
-            actions = self.actions
+            actions = self.actions,
+            mention_write = True
         )
 
         self.want_new_episode()
