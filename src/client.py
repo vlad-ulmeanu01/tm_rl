@@ -51,7 +51,6 @@ class MainClient(Client):
             self.agent.receive_new_state((x, y, z, yaw, pitch, roll, vx, vy, vz, wheel_materials, wheel_has_contact))
 
             if self.agent.agent_wants_new_episode: # after analyzing the newest state, the agent doesn't want to continue this episode anymore.
-                self.agent.agent_wants_new_episode = False # we expect the agent to have switched agent_wants_new_episode through want_new_episode()
                 self.on_checkpoint_count_changed(iface, current = -1, target = -1)
             else:
                 self.agent.next_action() # knowing the new state, ask the agent to compute the next action. it adds it to self.agent.actions.
@@ -75,11 +74,13 @@ class MainClient(Client):
 
         iface.prevent_simulation_finish()
 
-        if target != -1:
-            self.agent.episode_ended() # the episode actually ended. notify the agent. we expect it to also call want_new_episode.
-            self.agent.agent_wants_new_episode = False
+        # t1 = time.time()
+        self.agent.episode_ended(did_episode_end_normally = (target != -1))
+        # print(f"Expensive function took {round(time.time() - t1, 3)}s.")
 
-        iface.rewind_to_state(self.remembered_state) # we restart the simulation.
+        self.agent.agent_wants_new_episode = False
+
+        iface.rewind_to_state(self.remembered_state)  # we restart the simulation.
 
 
     def on_laps_count_changed(self, iface, current: int):

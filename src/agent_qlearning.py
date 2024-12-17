@@ -7,6 +7,7 @@ import pandas as pd
 import numpy as np
 import random
 import time
+import json
 import os
 
 import utils
@@ -18,13 +19,14 @@ class Agent:
         self.actions = ([], [], [])  # the actions that we have chosen during the episode.
         self.agent_wants_new_episode = False
 
-        self.episode_ind = 0  # the id of the current episode. 1-indexed.
-        self.dbg_every = 25  # forcefully debug every ??th episode. (e.g. have a run with argmax Q choices and print max(Q(s[0], a) | a).
+        self.episode_ind = 1  # the id of the current episode. 1-indexed.
+        self.dbg_every = 50  # forcefully debug every ??th episode. (e.g. have a run with argmax Q choices and print max(Q(s[0], a) | a).
 
         # hyperparameters:
         self.CNT_REPLAYS = len([entry for entry in os.scandir(utils.REPLAYS_DIR) if entry.is_file()])
         self.TOPK_CLOSEST = 3 * self.CNT_REPLAYS
-        self.REWARD_SPREAD_SQ_2X_INV = 1 / (2 * 3.0 ** 2)  # the smaller the spread, the closer the agent needs to be to a point to get the same reward.
+        self.REWARD_SPREAD = 3.0
+        self.REWARD_SPREAD_SQ_2X_INV = 1 / (2 * self.REWARD_SPREAD ** 2)  # the smaller the spread, the closer the agent needs to be to a point to get the same reward.
 
         self.RATE_UPD = 1 - 1e-3
         self.LR = 0.9  # Q-learning rate. lr *= rate_upd after each episode.
@@ -34,6 +36,8 @@ class Agent:
 
         self.REWARD_ON_FAIL = -int(utils.MAX_TIME // utils.GAP_TIME)  # the reward given when cancelling the episode.
         self.QL_TABLE_CNT_DECIMALS = 1  # how many decimals to keep in the (x, y, z) state representation.
+
+        self.CNT_REPEATING_ACTIONS = 20 # will choose a new action every CNT_REPEATING_ACTIONS.
         # hyperparameters end.
 
         self.replays_states_actions = []
@@ -68,7 +72,7 @@ class Agent:
 
         print(f"agent_qlearning loaded.")
 
-        self.want_new_episode()  # call want_new_episode() immediately here.
+        # self.want_new_episode()  # call want_new_episode() immediately here.
 
 
     """
@@ -78,6 +82,11 @@ class Agent:
     """
     def want_new_episode(self):
         self.agent_wants_new_episode = True
+
+    """
+    We call this.
+    """
+    def clear_episode(self):
         self.states = []
         self.actions = ([], [], [])
         self.episode_ind += 1
@@ -134,40 +143,45 @@ class Agent:
                 mention_write = False
             )
 
-            fig, ax = plt.subplots(1, 2, figsize = (12, 4))
+            # with open(f"{utils.QTABLE_OUTPUT_DIR_PREFIX}{int(self.dbg_tstart)}_{self.episode_ind}.json", 'w') as fout:
+            #     json.dump(self.q_table, fout)
 
-            ax[0].scatter(self.replays_states_actions[:, 0], self.replays_states_actions[:, 2], s = 1)
-            ax[0].set_title("Racing lines")
-
-            xs, zs = [x for x, y, z in self.q_table.keys()], [z for x, y, z in self.q_table.keys()]
-            best_qs = [max(action_q_ht.values()) for action_q_ht in self.q_table.values()]  # action_q_ht is a hashtable {action: best Q}.
-
-            sp = ax[1].scatter(xs, zs, c = best_qs, s = 0.25)
-            cbar = fig.colorbar(sp, ax = ax[1])
-            cbar.set_label("max(Q(s, a) | a)")
-
-            for i in range(2):
-                ax[i].set_xlabel('X'); ax[i].set_xlim(self.dbg_xlim)
-                ax[i].set_ylabel('Z'); ax[i].set_ylim(self.dbg_zlim)
-
-            fig.savefig(f"{utils.FIGURES_OUTPUT_DIR_PREFIX}{int(self.dbg_tstart)}/fig_{self.episode_ind}.png", bbox_inches = "tight")
+            # fig, ax = plt.subplots(1, 2, figsize = (12, 4))
+            #
+            # ax[0].scatter(self.replays_states_actions[:, 0], self.replays_states_actions[:, 2], s = 1)
+            # ax[0].set_title("Racing lines")
+            #
+            # xs, zs = [x for x, y, z in self.q_table.keys()], [z for x, y, z in self.q_table.keys()]
+            # best_qs = [max(action_q_ht.values()) for action_q_ht in self.q_table.values()]  # action_q_ht is a hashtable {action: best Q}.
+            #
+            # sp = ax[1].scatter(xs, zs, c = best_qs, s = 0.25)
+            # cbar = fig.colorbar(sp, ax = ax[1])
+            # cbar.set_label("max(Q(s, a) | a)")
+            #
+            # for i in range(2):
+            #     ax[i].set_xlabel('X'); ax[i].set_xlim(self.dbg_xlim)
+            #     ax[i].set_ylabel('Z'); ax[i].set_ylim(self.dbg_zlim)
+            #
+            # fig.savefig(f"{utils.FIGURES_OUTPUT_DIR_PREFIX}{int(self.dbg_tstart)}/fig_{self.episode_ind}.png", bbox_inches = "tight")
+            # plt.close(fig)
 
 
 
 
     """
-    Called by the client to let us know that the episode ended by finishing the map.
+    Called by the client to let us know that the episode ended, either normally by finishing the map, or forcefully by us.
     """
-    def episode_ended(self):
-        self.qlearn_update(did_episode_end_normally = True)
+    def episode_ended(self, did_episode_end_normally: bool):
+        self.qlearn_update(did_episode_end_normally)
 
-        utils.write_processed_output(
-            fname = f"{utils.PROCESSED_OUTPUT_DIR_PREFIX}{str(time.time()).replace('.', '')}_{(len(self.states) - 1) * utils.GAP_TIME}.txt",
-            actions = self.actions,
-            mention_write = True
-        )
+        if did_episode_end_normally:
+            utils.write_processed_output(
+                fname = f"{utils.PROCESSED_OUTPUT_DIR_PREFIX}{str(time.time()).replace('.', '')}_{(len(self.states) - 1) * utils.GAP_TIME}.txt",
+                actions = self.actions,
+                mention_write = True
+            )
 
-        self.want_new_episode()
+        self.clear_episode()
 
 
     """
@@ -188,7 +202,6 @@ class Agent:
             is_state_too_bad = True
 
         if is_state_too_bad:
-            self.qlearn_update(did_episode_end_normally = False)
             self.want_new_episode()
 
 
@@ -198,18 +211,23 @@ class Agent:
     The caller will access our internal self.actions list for further use.
     """
     def next_action(self):
-        if (random.random() < self.EPSILON and self.episode_ind % self.dbg_every) or self.states[-1] not in self.q_table:
-            best_steer = random.choice(utils.VALUES_STEER)
-            best_gas = utils.VAL_GAS # random.choice(utils.VALUES_GAS)
-            best_brake = utils.VAL_NO_BRAKE # random.choice(utils.VALUES_BRAKE)
+        if len(self.actions[0]) % self.CNT_REPEATING_ACTIONS:
+            # just copy the last action.
+            for ind in [utils.IND_STEER, utils.IND_GAS, utils.IND_BRAKE]:
+                self.actions[ind].append(self.actions[ind][-1])
         else:
-            best_action, best_q = (utils.VAL_NO_STEER, utils.VAL_GAS, utils.VAL_NO_BRAKE), None
+            if (random.random() < self.EPSILON and self.episode_ind % self.dbg_every) or self.states[-1] not in self.q_table:
+                best_steer = random.choice(utils.VALUES_STEER)
+                best_gas = utils.VAL_GAS # random.choice(utils.VALUES_GAS)
+                best_brake = utils.VAL_NO_BRAKE # random.choice(utils.VALUES_BRAKE)
+            else:
+                best_action, best_q = (utils.VAL_NO_STEER, utils.VAL_GAS, utils.VAL_NO_BRAKE), None
 
-            for action, q in self.q_table[self.states[-1]].items():
-                if best_q is None or q > best_q:
-                    best_action, best_q = action, q
-            best_steer, best_gas, best_brake = best_action
+                for action, q in self.q_table[self.states[-1]].items():
+                    if best_q is None or q > best_q:
+                        best_action, best_q = action, q
+                best_steer, best_gas, best_brake = best_action
 
-        self.actions[utils.IND_STEER].append(best_steer)
-        self.actions[utils.IND_GAS].append(best_gas)
-        self.actions[utils.IND_BRAKE].append(best_brake)
+            self.actions[utils.IND_STEER].append(best_steer)
+            self.actions[utils.IND_GAS].append(best_gas)
+            self.actions[utils.IND_BRAKE].append(best_brake)

@@ -11,7 +11,7 @@ class Agent:
 
         self.agent_wants_new_episode = False
 
-        self.want_new_episode() # call want_new_episode() immediately here.
+        # self.want_new_episode() # call want_new_episode() immediately here.
 
     """
     Signal to the client that we want to begin a new episode. We may call this in the other two functions if we:
@@ -19,10 +19,15 @@ class Agent:
     * or no longer want to explore the current episode.
     """
     def want_new_episode(self):
+        # TODO fixeaza logica si in exemplu.
         self.agent_wants_new_episode = True
+
+    """
+    We call this.
+    """
+    def clear_episode(self):
         self.states = []
         self.actions = ([], [], [])
-
 
     """
     Called by the client to give us a new state. Is called by the client because we either: 
@@ -42,16 +47,19 @@ class Agent:
 
 
     """
-    Called by the client to let us know that the episode ended by finishing the map.
+    Called by the client to let us know that the episode ended, either normally by finishing the map, or forcefully by us.
     """
-    def episode_ended(self):
+    def episode_ended(self, did_episode_end_normally: bool):
         # ! in-time game is actually (len(self.states) - 1) * utils.GAP_TIME.
-        utils.write_processed_output(
-            fname = f"{utils.PROCESSED_OUTPUT_DIR_PREFIX}{str(time.time()).replace('.', '')}_{(len(self.states) - 1) * utils.GAP_TIME}.txt",
-            actions = self.actions
-        )
 
-        self.want_new_episode()
+        if did_episode_end_normally:
+            utils.write_processed_output(
+                fname = f"{utils.PROCESSED_OUTPUT_DIR_PREFIX}{str(time.time()).replace('.', '')}_{(len(self.states) - 1) * utils.GAP_TIME}.txt",
+                actions = self.actions,
+                mention_write = True
+            )
+
+        self.clear_episode()
 
 
     """
