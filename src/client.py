@@ -8,7 +8,7 @@ import copy
 import time
 import sys
 
-import agent_qlearning
+import agent_qnet
 import utils
 
 
@@ -16,7 +16,7 @@ class MainClient(Client):
     def __init__(self):
         super().__init__()
 
-        self.agent = agent_qlearning.Agent()
+        self.agent = agent_qnet.Agent()
         self.remembered_state = None
 
     def on_registered(self, iface: TMInterface):
@@ -74,9 +74,9 @@ class MainClient(Client):
 
         iface.prevent_simulation_finish()
 
-        # t1 = time.time()
+        t1 = time.time()
         self.agent.episode_ended(did_episode_end_normally = (target != -1))
-        # print(f"Expensive function took {round(time.time() - t1, 3)}s.")
+        print(f"Expensive function took {round(time.time() - t1, 3)}s.")
 
         self.agent.agent_wants_new_episode = False
 
