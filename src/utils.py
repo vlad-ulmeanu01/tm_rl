@@ -5,7 +5,7 @@ GAP_TIME = 10 # ms, length of one timestep.
 PROCESSED_OUTPUT_DIR_PREFIX = "../processed_outputs/output_"
 PARTIAL_OUTPUT_DIR_PREFIX = "../qlearning_outputs/partial_"
 FIGURES_OUTPUT_DIR_PREFIX = "../figures/"
-QTABLE_OUTPUT_DIR_PREFIX = "../qtable_outputs/qtable_"
+QNET_OUTPUT_DIR_PREFIX = "../qnet_outputs/qtable_"
 
 IND_STEER, IND_GAS, IND_BRAKE = 0, 1, 2
 

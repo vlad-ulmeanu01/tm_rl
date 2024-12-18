@@ -181,6 +181,9 @@ class Agent:
                 mention_write = False
             )
 
+            with open(f"{utils.QNET_OUTPUT_DIR_PREFIX}{int(self.dbg_tstart)}_{self.episode_ind}.txt", 'w') as fout:
+                fout.write(f"{self.qnet_params}\n")
+
 
     """
     Called by the client to let us know that the episode ended, either normally by finishing the map, or forcefully by us.
