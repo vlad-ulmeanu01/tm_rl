@@ -144,12 +144,19 @@ class Agent:
 
                 expected_q = Tensor([np.float32(r + self.DISCOUNT_FACTOR * self.qnet.compute_best_action_q(self.states[i+1])[1])])
 
-            Tensor.training = True
-            loss = 0.5 * ((q - expected_q) ** 2).mean()
-            self.qnet_optimizer.zero_grad()
-            loss.backward()
-            self.qnet_optimizer.step()
-            Tensor.training = False
+            t2 = time.time()
+            print(f"{round(t2 - t1, 3)}, ", end = '')
+            t1 = t2
+
+            with Tensor.train():
+                loss = 0.5 * ((q - expected_q) ** 2).mean()
+                self.qnet_optimizer.zero_grad()
+                loss.backward()
+                self.qnet_optimizer.step()
+
+            t2 = time.time()
+            print(f"{round(t2 - t1, 3)}")
+            t1 = t2
 
         self.LR *= self.RATE_UPD
         self.EPSILON *= self.RATE_UPD
