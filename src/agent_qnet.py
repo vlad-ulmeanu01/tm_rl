@@ -1,41 +1,64 @@
 from sklearn.neighbors import KDTree
-from tinygrad import Tensor, nn
+import jax.numpy as jnp
 import pandas as pd
 import numpy as np
 import random
 import time
+import jax
 import os
 
 import utils
 
-class QNet:
-    def __init__(self, s_mean: np.array, s_std: np.array):
-        self.l1 = nn.Linear(10, 32, bias = True)
-        self.l2 = nn.Linear(32, 1, bias = True)
-        self.s_mean = s_mean
-        self.s_std = s_std
+def qnet_init_params():
+    def random_layer_params(l, r, key, scale=1e-2):
+        w_key, b_key = jax.random.split(key)
+        return scale * jax.random.normal(w_key, (l, r)), scale * jax.random.normal(b_key, (r,))
 
-    def __call__(self, s: tuple, steer, gas, brake, requires_grad) -> Tensor:
-        x = Tensor([(s[0] - self.s_mean[0]) / self.s_std[0], (s[1] - self.s_mean[1]) / self.s_std[1], (s[2] - self.s_mean[2]) / self.s_std[2],
-                    1.0 if steer == utils.VAL_STEER_LEFT else 0.0, 1.0 if steer == utils.VAL_NO_STEER else 0.0, 1.0 if steer == utils.VAL_STEER_RIGHT else 0.0,
-                    1.0 if steer == utils.VAL_NO_GAS else 0.0, 1.0 if steer == utils.VAL_GAS else 0.0,
-                    1.0 if steer == utils.VAL_NO_BRAKE else 0.0, 1.0 if steer == utils.VAL_BRAKE else 0.0], requires_grad = requires_grad)
+    layer_sizes = [3 + 3 + 2 + 2, 32, 1]
+    return [random_layer_params(l, r, k) for l, r, k in zip(layer_sizes[:-1], layer_sizes[1:], jax.random.split(jax.random.key(0), len(layer_sizes)))]
 
-        x = self.l1(x)
-        x = x.relu()
-        x = self.l2(x)
+@jax.jit
+def qnet_forward(params, s_mean: jnp.array, s_std: jnp.array, s, a):
+    x = jnp.array([
+        *(jnp.array(s) - s_mean) / s_std,
+        jnp.where(a[utils.IND_STEER] == utils.VAL_STEER_LEFT, 1.0, 0.0),
+        jnp.where(a[utils.IND_STEER] == utils.VAL_NO_STEER, 1.0, 0.0),
+        jnp.where(a[utils.IND_STEER] == utils.VAL_STEER_RIGHT, 1.0, 0.0),
+        jnp.where(a[utils.IND_GAS] == utils.VAL_NO_GAS, 1.0, 0.0),
+        jnp.where(a[utils.IND_GAS] == utils.VAL_GAS, 1.0, 0.0),
+        jnp.where(a[utils.IND_BRAKE] == utils.VAL_NO_BRAKE, 1.0, 0.0),
+        jnp.where(a[utils.IND_BRAKE] == utils.VAL_BRAKE, 1.0, 0.0)
+    ])
 
-        return x
+    return jnp.dot(jax.nn.relu(jnp.dot(x, params[0][0]) + params[0][1]), params[1][0]) + params[1][1]
 
-    def compute_best_action_q(self, s: tuple):
-        best_q, best_action = None, None
-        for steer in utils.VALUES_STEER:
-            action = steer, utils.VAL_GAS, utils.VAL_NO_BRAKE
-            q = self.__call__(s, *action, requires_grad = False).numpy()[0]
-            if best_q is None or q > best_q:
-                best_action, best_q = action, q
-        return best_action, best_q
+@jax.jit
+def qnet_loss_fn(params, s_mean: jnp.array, s_std: jnp.array, s, a, y):
+    yhat = qnet_forward(params, s_mean, s_std, s, a)
+    y = jnp.array([y])
+    return 0.5 * jnp.mean((yhat - y) ** 2)
 
+@jax.jit
+def qnet_loss_backward(params, s_mean: jnp.array, s_std: jnp.array, lr: jnp.float32, s, a, y):
+    loss, grads = jax.value_and_grad(qnet_loss_fn, argnums = 0)(params, s_mean, s_std, s, a, y)
+    return [(w - lr * dw, b - lr * db) for (w, b), (dw, db) in zip(params, grads)], loss
+
+@jax.jit
+def jit_compute_best_action_q(params, s_mean: jnp.array, s_std: jnp.array, s):
+    s = (jnp.array(s) - s_mean) / s_std
+
+    x = jax.lax.stop_gradient(jnp.vstack([
+        [*s, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0],
+        [*s, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0],
+        [*s, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0]
+    ]))
+
+    return jnp.dot(jax.nn.relu(jnp.dot(x, params[0][0]) + params[0][1]), params[1][0]) + params[1][1]
+
+def compute_best_action_q(params, s_mean: jnp.array, s_std: jnp.array, s):
+    q = jit_compute_best_action_q(params, s_mean, s_std, s)
+    best_ind = q.argmax().item()
+    return utils.VALUES_STEER[best_ind], q[best_ind].item()
 
 class Agent:
     def __init__(self):
@@ -83,12 +106,9 @@ class Agent:
         self.visited_replay_state = np.zeros(self.replays_states_actions.shape[0], dtype = np.int32)  # will not count towards a reward the same replay state twice in the same episode.
         self.visited_replay_state.fill(-1)
 
-        self.qnet = QNet(
-            s_mean = np.array([np.float32(self.replays_states_actions[:, i].mean()) for i in range(3)]),
-            s_std = np.array([np.float32(self.replays_states_actions[:, i].std()) for i in range(3)])
-        )
-
-        self.qnet_optimizer = nn.optim.SGD([self.qnet.l1.weight, self.qnet.l1.bias, self.qnet.l2.weight, self.qnet.l2.bias], lr = 1e-3)
+        self.s_mean = jnp.array([np.float32(self.replays_states_actions[:, i].mean()) for i in range(3)])
+        self.s_std = jnp.array([np.float32(self.replays_states_actions[:, i].std()) for i in range(3)])
+        self.qnet_params = qnet_init_params()
 
         self.dbg_tstart = time.time()
 
@@ -112,7 +132,6 @@ class Agent:
         self.episode_ind += 1
         self.visited_replay_state.fill(-1)
 
-
     """
     We call this either from episode_ended() with did_episode_end_normally = True, or from receive_new_state(), after cancelling an episode with did_episode_end_normally = False.
     This should compute intermediate rewards and update the Q table.
@@ -125,15 +144,13 @@ class Agent:
                 if self.visited_replay_state[indexes[i, j]] == -1:
                     self.visited_replay_state[indexes[i, j]] = i
 
-        t1 = time.time()
+        running_loss = 0.0
         for i in range(len(self.actions[0]) - 1, -1, -1):
             s, a = self.states[i], (self.actions[utils.IND_STEER][i], self.actions[utils.IND_GAS][i], self.actions[utils.IND_BRAKE][i])
 
-            q = self.qnet(s, *a, requires_grad = True)  # the current Q(s, a).
-
             if i + 1 == len(self.actions[0]):
                 last_reward = int(utils.MAX_TIME // utils.GAP_TIME) - (len(self.states) - 1) if did_episode_end_normally else 0
-                expected_q = Tensor([np.float32(last_reward)])  # Q(s, a) <- (1 - lr) * Q(s, a) + lr * last_reward
+                expected_q = np.float32(last_reward)  # Q(s, a) <- (1 - lr) * Q(s, a) + lr * last_reward
             else:
                 # compute r(s, a):
                 z = np.exp(- np.linalg.norm(self.replays_states_actions[indexes[i], :3] - s, axis = 1) * self.REWARD_SPREAD_SQ_2X_INV)
@@ -142,27 +159,21 @@ class Agent:
                                                               all(self.replays_states_actions[indexes[i, j]][3:] == a)
                 ]) / self.TOPK_CLOSEST
 
-                expected_q = Tensor([np.float32(r + self.DISCOUNT_FACTOR * self.qnet.compute_best_action_q(self.states[i+1])[1])])
+                expected_q = np.float32(r + self.DISCOUNT_FACTOR * compute_best_action_q(self.qnet_params, self.s_mean, self.s_std, self.states[i+1])[1])
 
-            t2 = time.time()
-            print(f"{round(t2 - t1, 3)}, ", end = '')
-            t1 = t2
+            # We compute the current Q(s, a) below as well.
+            self.qnet_params, loss = qnet_loss_backward(self.qnet_params, self.s_mean, self.s_std, 1e-3, s, a, expected_q)
+            running_loss += loss
 
-            with Tensor.train():
-                loss = 0.5 * ((q - expected_q) ** 2).mean()
-                self.qnet_optimizer.zero_grad()
-                loss.backward()
-                self.qnet_optimizer.step()
-
-            t2 = time.time()
-            print(f"{round(t2 - t1, 3)}")
-            t1 = t2
+        running_loss /= len(self.actions[0])
+        print(f"avg running_loss = {round(running_loss, 3)}")
 
         self.LR *= self.RATE_UPD
         self.EPSILON *= self.RATE_UPD
 
         if self.episode_ind % self.dbg_every == 0:
-            print(f"{round(time.time() - self.dbg_tstart, 3)}s, {self.episode_ind = }, max(Q(s[0], a) | a) = {round(self.qnet.compute_best_action_q(self.states[0])[1], 3)}.")
+            maxq_s0 = compute_best_action_q(self.qnet_params, self.s_mean, self.s_std, self.states[0])[1]
+            print(f"{round(time.time() - self.dbg_tstart, 3)}s, {self.episode_ind = }, max(Q(s[0], a) | a) = {round(maxq_s0, 3)}.")
 
             utils.write_processed_output(
                 fname = f"{utils.PARTIAL_OUTPUT_DIR_PREFIX}{int(self.dbg_tstart)}_{self.episode_ind}.txt",
@@ -193,10 +204,10 @@ class Agent:
     * responded to send_action(), and now we got the resulting next state.
     """
     def receive_new_state(self, state: tuple):
-        self.states.append((state[utils.IND_X], state[utils.IND_Y], state[utils.IND_Z]))
+        self.states.append(([state[utils.IND_X], state[utils.IND_Y], state[utils.IND_Z]]))
 
         is_state_too_bad = False  # e.g. too far from other racing lines or too much time has passed <=> self.states array length is too big.
-        if len(self.states) * utils.GAP_TIME >= utils.MAX_TIME:
+        if len(self.states) * utils.GAP_TIME > utils.MAX_TIME:
             is_state_too_bad = True
 
         if is_state_too_bad:
@@ -214,12 +225,13 @@ class Agent:
             for ind in [utils.IND_STEER, utils.IND_GAS, utils.IND_BRAKE]:
                 self.actions[ind].append(self.actions[ind][-1])
         else:
+            best_gas = utils.VAL_GAS  # random.choice(utils.VALUES_GAS)
+            best_brake = utils.VAL_NO_BRAKE  # random.choice(utils.VALUES_BRAKE)
+
             if random.random() < self.EPSILON and self.episode_ind % self.dbg_every:
                 best_steer = random.choice(utils.VALUES_STEER)
-                best_gas = utils.VAL_GAS # random.choice(utils.VALUES_GAS)
-                best_brake = utils.VAL_NO_BRAKE # random.choice(utils.VALUES_BRAKE)
             else:
-                best_steer, best_gas, best_brake = self.qnet.compute_best_action_q(self.states[-1])[0]
+                best_steer = compute_best_action_q(self.qnet_params, self.s_mean, self.s_std, self.states[-1])[0]
 
             self.actions[utils.IND_STEER].append(best_steer)
             self.actions[utils.IND_GAS].append(best_gas)
