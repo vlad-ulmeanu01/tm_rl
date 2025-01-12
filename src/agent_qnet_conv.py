@@ -1,4 +1,8 @@
+import matplotlib
+matplotlib.use("Agg")
+
 from sklearn.neighbors import KDTree
+import matplotlib.pyplot as plt
 from collections import deque
 import pandas as pd
 import numpy as np
@@ -71,6 +75,7 @@ class Agent:
         self.REWARD_RADIUS = 1 # only attempt to reward replay points that are this close to the current position.
         self.REWARD_COEF = 0.25
         self.REWARD_MAX_EXPONENT = 5
+        self.REWARD_MIN_FRAME = 100
 
         self.DISCOUNT_FACTOR = 0.995
         self.EPSILON_START, self.EPSILON_END, self.EPSILON_DECAY = 0.9, 0.05, 500 # epsilon greedy policy.
@@ -112,7 +117,19 @@ class Agent:
         cent_x_half = (np.logspace(0, 1, 10) - 1) / 9; cent_x = np.concatenate([-cent_x_half[1:][::-1], cent_x_half])
         cent_y = np.linspace(-1, 1, 9)
         cent_z = np.linspace(-1, 1, 19)
-        self.mesh_kdt = KDTree([(x, y, z) for x in cent_x for y in cent_y for z in cent_z])
+        self.mesh_kdt = KDTree([(x, y, z) for x in cent_x for y in cent_y for z in cent_z], leaf_size = 3, metric = "l1")
+
+        self.mesh_id_to_loc = np.zeros((len(cent_x) * len(cent_y) * len(cent_z), 3), dtype = np.int32)
+        ind_x, ind_y, ind_z = 0, 0, 0
+        for ind in range(len(self.mesh_id_to_loc)):
+            self.mesh_id_to_loc[ind] = (ind_x, ind_y, ind_z)
+            ind_z += 1
+            if ind_z >= len(cent_z):
+                ind_z = 0
+                ind_y += 1
+                if ind_y >= len(cent_y):
+                    ind_y, ind_z = 0, 0
+                    ind_x += 1
 
         self.replay_buffer = deque([], maxlen = self.REPLAY_BUFSIZE)
 
@@ -121,6 +138,9 @@ class Agent:
         self.qnet_optimizer = torch.optim.Adam(self.qnet.parameters())
 
         self.dbg_tstart = time.time()
+        self.dbg_time_spent = {"receive_new_state": 0.0, "rns_kdt": 0.0, "rns_trans": 0.0, "rns_mesh1": 0.0, "rns_mesh2": 0.0, "next_action": 0.0}
+
+        # self.dbg_fig, self.dbg_ax = plt.subplots(2, 2, figsize = (10, 5))
 
         print(f"agent_qnet_conv loaded.")
 
@@ -143,6 +163,7 @@ class Agent:
         self.rewards = []
         self.episode_ind += 1
         self.visited_replay_state.fill(-1)
+        self.dbg_time_spent = {x: 0.0 for x in self.dbg_time_spent}
 
     """
     We call this from episode_ended().
@@ -187,7 +208,7 @@ class Agent:
             loop_id += 1
 
         running_loss /= (self.BATCH_SIZE * loop_id)
-        print(f"finished {loop_id} batches, avg loss per action output = {round(running_loss, 3)}.")
+        print(f"finished {loop_id} batches, avg loss per action output = {round(running_loss, 7)}.")
 
 
     """
@@ -201,19 +222,31 @@ class Agent:
         if len(self.state_ims) >= 2:
             self.replay_buffer.append(Transition(self.state_ims[-2], self.actions[-1], self.rewards[-1], None))
 
+        print(f"Episode {self.episode_ind}:")
+        print(f"Rewards: min = {round(min(self.rewards), 3)}, avg = {round(sum(self.rewards) / len(self.rewards), 3)}, max = {round(max(self.rewards), 3)}, sum = {round(sum(self.rewards), 3)}")
+        print(f"Time from start: {round(time.time() - self.dbg_tstart, 3)}, this episode in receive_new_state: {round(self.dbg_time_spent['receive_new_state'], 3)}, next_action: {round(self.dbg_time_spent['next_action'], 3)}")
+        # print(f"rns_kdt: {round(self.dbg_time_spent['rns_kdt'], 3)}, rns_trans: {round(self.dbg_time_spent['rns_trans'], 3)}, rns_mesh1: {round(self.dbg_time_spent['rns_mesh1'], 3)}, rns_mesh2: {round(self.dbg_time_spent['rns_mesh2'], 3)}")
+
+        # self.dbg_ax[0, 0].clear(); self.dbg_ax[0, 1].clear(); self.dbg_ax[1, 0].clear(); self.dbg_ax[1, 1].clear()
+        # self.dbg_ax[0, 0].plot(self.rewards); self.dbg_ax[0, 0].set_title(f"Reward plot for episode {self.episode_ind}")
+        # self.dbg_ax[0, 1].plot([steer for steer, _, _ in self.actions]); self.dbg_ax[0, 1].set_title("Steer")
+        # self.dbg_ax[1, 0].plot([gas for  _, gas, _ in self.actions]); self.dbg_ax[0, 1].set_title("Gas")
+        # self.dbg_ax[1, 1].plot([brake for _, _, brake in self.actions]); self.dbg_ax[0, 1].set_title("Brake")
+        # self.dbg_fig.savefig(f"{utils.FIGURES_OUTPUT_DIR_PREFIX}fig_{int(self.dbg_tstart)}_{self.episode_ind}.png", bbox_inches = "tight")
+
         self.qlearn_update()
 
+        utils.write_processed_output(
+            fname = f"{utils.PARTIAL_OUTPUT_DIR_PREFIX}{int(self.dbg_tstart)}_{self.episode_ind}_{(len(self.states) - 1) * utils.GAP_TIME}.txt",
+            actions = self.actions,
+            mention_write = False
+        )
         if self.episode_ind % self.dbg_every == 0:
             torch.save(self.qnet.state_dict(), f"{utils.QNET_OUTPUT_DIR_PREFIX}net_{int(self.dbg_tstart)}_{self.episode_ind}.pt")
-            utils.write_processed_output(
-                fname = f"{utils.PARTIAL_OUTPUT_DIR_PREFIX}{int(self.dbg_tstart)}_{str(time.time()).replace('.', '')}_{(len(self.states) - 1) * utils.GAP_TIME}.txt",
-                actions = self.actions,
-                mention_write = False
-            )
 
         if did_episode_end_normally:
             utils.write_processed_output(
-                fname = f"{utils.PROCESSED_OUTPUT_DIR_PREFIX}{int(self.dbg_tstart)}_{str(time.time()).replace('.', '')}_{(len(self.states) - 1) * utils.GAP_TIME}.txt",
+                fname = f"{utils.PROCESSED_OUTPUT_DIR_PREFIX}{int(self.dbg_tstart)}_{self.episode_ind}_{(len(self.states) - 1) * utils.GAP_TIME}.txt",
                 actions = self.actions,
                 mention_write = True
             )
@@ -227,14 +260,16 @@ class Agent:
     * responded to send_action(), and now we got the resulting next state.
     """
     def receive_new_state(self, state: tuple):
+        tstart = time.time()
+
         self.states.append(state)
 
         # compute the new image state state_im here.
-        state_im = torch.zeros(1, *self.qnet.imsize) # 1 = in_channels.
+        state_im = np.zeros((1, *self.qnet.imsize), dtype = np.float32) # 1 = in_channels.
 
         new_origin = (state[utils.IND_X], state[utils.IND_Y], state[utils.IND_Z], state[utils.IND_YAW], state[utils.IND_PITCH], state[utils.IND_ROLL])
-
         indexes = self.replays_kdt.query_radius([new_origin[:3]], r = self.POINTS_RADIUS)[0]
+
         if len(indexes):
             pts_trans = utils.transform_about(self.replays_states_actions[indexes, :3], new_origin)
             pts_replay_tags = self.replays_states_actions[indexes, -1] # need to know for each selected point from which replay was it chosen.
@@ -243,21 +278,20 @@ class Agent:
             pts_trans /= self.POINTS_RADIUS
             pts_trans[:, 0] *= -1 # TM: X is inverted.
 
-            mesh_indexes = self.mesh_kdt.query(pts_trans, return_distance = False).reshape(-1) # to what mesh point was each pts_trans matched.
-            mesh_visited = np.zeros((*self.qnet.imsize, self.CNT_REPLAYS), dtype = np.bool_)
+            if sum(mask_close_y):
+                # TODO this if needs to be (again) sped up.
+                mesh_indexes = self.mesh_kdt.query(pts_trans[mask_close_y], return_distance = False).reshape(-1) # to what mesh point was each pts_trans matched.
 
-            for tag, mesh_ind in zip(map(int, pts_replay_tags[mask_close_y]), mesh_indexes[mask_close_y]):
-                ind_x = mesh_ind // (self.qnet.imsize[1] * self.qnet.imsize[2])
-                ind_y = mesh_ind % (self.qnet.imsize[1] * self.qnet.imsize[2]) // self.qnet.imsize[2]
-                ind_z = mesh_ind % (self.qnet.imsize[1] * self.qnet.imsize[2]) % self.qnet.imsize[2]
+                mesh_visited = np.zeros((*self.qnet.imsize, self.CNT_REPLAYS), dtype = np.bool_)
+                for tag, mesh_ind in zip(map(int, pts_replay_tags[mask_close_y]), mesh_indexes):
+                    ind_x, ind_y, ind_z = self.mesh_id_to_loc[mesh_ind]
+                    if not mesh_visited[ind_x, ind_y, ind_z, tag]:
+                        mesh_visited[ind_x, ind_y, ind_z, tag] = True
+                        state_im[0, ind_x, ind_y, ind_z] += 1
 
-                if not mesh_visited[ind_x, ind_y, ind_z, tag]:
-                    mesh_visited[ind_x, ind_y, ind_z, tag] = True
-                    state_im[0, ind_x, ind_y, ind_z] += 1
+                state_im /= self.CNT_REPLAYS
 
-            state_im /= self.CNT_REPLAYS
-
-        self.state_ims.append(state_im)
+        self.state_ims.append(torch.tensor(state_im))
         if len(self.actions) > 1:
             # we will put the latest Transition only when we finish the episode, we want to mark the next state as None, and optionally increase the reward.
             self.replay_buffer.append(Transition(self.state_ims[-3], self.actions[-2], self.rewards[-2], self.state_ims[-2]))
@@ -267,6 +301,9 @@ class Agent:
         # or too far away from any replay point.
         if len(self.states) * utils.GAP_TIME > utils.MAX_TIME or len(indexes) == 0:
             is_state_too_bad = True
+
+        # print(f"dbg receive_new_state, spent {round(time.time() - tstart, 3)}, {len(indexes) = }.")
+        self.dbg_time_spent["receive_new_state"] += time.time() - tstart
 
         if is_state_too_bad:
             self.want_new_episode()
@@ -278,21 +315,24 @@ class Agent:
     The caller will access our internal self.actions list for further use.
     """
     def next_action(self):
+        tstart = time.time()
+
         if len(self.actions) % self.CNT_REPEATING_ACTIONS:
             # just copy the last action.
             self.actions.append(self.actions[-1])
         else:
-            # best_gas = utils.VAL_GAS
-            # best_brake = utils.VAL_NO_BRAKE
+            best_gas = utils.VAL_GAS
+            best_brake = utils.VAL_NO_BRAKE
 
             eps = self.EPSILON_END + (self.EPSILON_START - self.EPSILON_END) * math.exp(-self.episode_ind / self.EPSILON_DECAY)
             if random.random() < eps and self.episode_ind % self.dbg_every:
                 best_steer = random.choice(utils.VALUES_STEER)
-                best_gas = random.choice(utils.VALUES_GAS)
-                best_brake = random.choice(utils.VALUES_BRAKE)
+                # best_gas = random.choice(utils.VALUES_GAS)
+                # best_brake = random.choice(utils.VALUES_BRAKE)
             else:
                 with torch.no_grad(): # we need to unsqueeze for batch_size = 1.
-                    best_steer, best_gas, best_brake = utils.VALUES_ACTIONS[self.qnet(self.state_ims[-1].unsqueeze(dim = 0))[0].argmax().item()]
+                    # best_steer, best_gas, best_brake = utils.VALUES_ACTIONS[self.qnet(self.state_ims[-1].unsqueeze(dim = 0))[0].argmax().item()]
+                    best_steer, _, _ = utils.VALUES_ACTIONS[self.qnet(self.state_ims[-1].unsqueeze(dim = 0))[0].argmax().item()]
 
             self.actions.append((best_steer, best_gas, best_brake))
 
@@ -305,7 +345,7 @@ class Agent:
         indexes = self.replays_kdt.query_radius([self.states[-1][:3]], r = self.REWARD_RADIUS)[0]
         frame_at_replay = self.replays_states_actions[indexes, -2] # at what frame in the replay does the replay hit the close point.
         for ind, replay_frame in zip(indexes, frame_at_replay):
-            if self.visited_replay_state[ind] == -1:
+            if replay_frame >= self.REWARD_MIN_FRAME and self.visited_replay_state[ind] == -1:
                 self.visited_replay_state[ind] = 0
                 frame = len(self.states) - 1
 
@@ -313,3 +353,5 @@ class Agent:
                 reward += math.exp(min(self.REWARD_MAX_EXPONENT, (replay_frame - frame) * self.REWARD_COEF))
 
         self.rewards.append(reward)
+
+        self.dbg_time_spent["next_action"] += time.time() - tstart
