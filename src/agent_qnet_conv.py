@@ -28,7 +28,7 @@ class DQN(torch.nn.Module):
         self.fc_layers = torch.nn.Sequential(
             torch.nn.Linear(fc_insize, 32),
             torch.nn.ReLU(),
-            torch.nn.Linear(32, utils.VALUES_STEER * utils.VALUES_GAS * utils.VALUES_BRAKE)
+            torch.nn.Linear(32, len(utils.VALUES_ACTIONS))
         )
 
     # state_im should have a shape of [batch_size, in_channels = 1, *self.imsize].
@@ -117,7 +117,7 @@ class Agent:
         self.replay_buffer = deque([], maxlen = self.REPLAY_BUFSIZE)
 
         self.qnet = DQN()
-        self.qnet_criterion = torch.nn.MSELoss()
+        self.qnet_criterion = torch.nn.SmoothL1Loss()
         self.qnet_optimizer = torch.optim.Adam(self.qnet.parameters())
 
         self.dbg_tstart = time.time()
@@ -153,16 +153,13 @@ class Agent:
             return
 
         t_start = time.time()
+        running_loss, loop_id = 0.0, 0
         while time.time() - t_start < utils.MAX_TIME_INBETWEEN_RUNS:
             samples = random.sample(self.replay_buffer, self.BATCH_SIZE)
 
             state_im_batch = torch.stack([transition.state_im for transition in samples]) # shape: [batch_size, 1, 19, 9, 19].
-            assert list(state_im_batch.shape) == [self.BATCH_SIZE, 1, 19, 9, 19], f"{state_im_batch.shape = }"
-
             next_state_im_batch_nonfinal = torch.stack([transition.next_state_im for transition in samples if transition.next_state_im is not None]) # shape: [<= batch_size, 1, 19, 9, 19].
-
             state_action_values = self.qnet(state_im_batch) # shape: [batch_size, 12].
-            assert list(state_action_values.shape) == [self.BATCH_SIZE, 12], f"{state_action_values.shape = }"
 
             with torch.no_grad():
                 next_state_action_values_nonfinal = self.qnet(next_state_im_batch_nonfinal).max(dim = 1).values
@@ -173,18 +170,24 @@ class Agent:
                     action_id = utils.ACTION_INDEX_HT[samples[batch_id].action]
 
                     # we only modify action_id's expected value, because it's the only action that we actually did in the episode.
-                    if samples.next_state_im is None:
+                    if samples[batch_id].next_state_im is None:
                         expected_state_action_values[batch_id, action_id] = 0
                     else:
                         expected_state_action_values[batch_id, action_id] = samples[batch_id].reward + self.DISCOUNT_FACTOR * next_state_action_values_nonfinal[nonfinal_id]
                         nonfinal_id += 1
 
             loss = self.qnet_criterion(state_action_values, expected_state_action_values)
+            running_loss += loss.item()
+
             self.qnet_optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_value_(self.qnet.parameters(), 100)
             self.qnet_optimizer.step()
 
-            print(f"finished another batch run in {round(time.time() - t_start, 3)}s.")
+            loop_id += 1
+
+        running_loss /= (self.BATCH_SIZE * loop_id)
+        print(f"finished {loop_id} batches, avg loss per action output = {round(running_loss, 3)}.")
 
 
     """
@@ -193,8 +196,10 @@ class Agent:
     def episode_ended(self, did_episode_end_normally: bool):
         if did_episode_end_normally:
             self.rewards[-1] += utils.MAX_TIME - (len(self.states) - 1)
+
         # we add the last transition from the episode in the buffer. We mark the next state as None to recall its Q(s, .) as 0.
-        self.replay_buffer.append(Transition(self.state_ims[-2], self.actions[-1], self.rewards[-1], None))
+        if len(self.state_ims) >= 2:
+            self.replay_buffer.append(Transition(self.state_ims[-2], self.actions[-1], self.rewards[-1], None))
 
         self.qlearn_update()
 
@@ -225,38 +230,42 @@ class Agent:
         self.states.append(state)
 
         # compute the new image state state_im here.
-
-        new_origin = (state[utils.IND_X], state[utils.IND_Y], state[utils.IND_Z], state[utils.IND_YAW], state[utils.IND_PITCH], state[utils.IND_ROLL])
-        indexes = self.replays_kdt.query_radius([new_origin[:3]], r = self.POINTS_RADIUS)[0]
-        pts_trans = utils.transform_about(self.replays_states_actions[indexes, :3], new_origin)
-        pts_replay_tags = self.replays_states_actions[indexes, -1] # need to know for each selected point from which replay was it chosen.
-
-        mask_close_y = (-self.TRANS_DIFF_Y <= pts_trans[:, 1]) & (pts_trans[:, 1] <= self.TRANS_DIFF_Y)
-        pts_trans /= self.POINTS_RADIUS
-        pts_trans[:, 0] *= -1 # TM: X is inverted.
-
-        mesh_indexes = self.mesh_kdt.query(pts_trans, return_distance = False) # to what mesh point was each pts_trans matched.
-        mesh_visited = np.zeros((*self.qnet.imsize, self.CNT_REPLAYS), dtype = np.bool_)
         state_im = torch.zeros(1, *self.qnet.imsize) # 1 = in_channels.
 
-        for tag, mesh_ind in zip(pts_replay_tags[mask_close_y], mesh_indexes[mask_close_y]):
-            ind_x = mesh_ind // (self.qnet.imsize[1] * self.qnet.imsize[2])
-            ind_y = mesh_ind % (self.qnet.imsize[1] * self.qnet.imsize[2]) // self.qnet.imsize[2]
-            ind_z = mesh_ind % (self.qnet.imsize[1] * self.qnet.imsize[2]) % self.qnet.imsize[2]
+        new_origin = (state[utils.IND_X], state[utils.IND_Y], state[utils.IND_Z], state[utils.IND_YAW], state[utils.IND_PITCH], state[utils.IND_ROLL])
 
-            if not mesh_visited[ind_x, ind_y, ind_z, tag]:
-                mesh_visited[ind_x, ind_y, ind_z, tag] = True
-                state_im[0, ind_x, ind_y, ind_z] += 1
+        indexes = self.replays_kdt.query_radius([new_origin[:3]], r = self.POINTS_RADIUS)[0]
+        if len(indexes):
+            pts_trans = utils.transform_about(self.replays_states_actions[indexes, :3], new_origin)
+            pts_replay_tags = self.replays_states_actions[indexes, -1] # need to know for each selected point from which replay was it chosen.
 
-        state_im /= self.CNT_REPLAYS
+            mask_close_y = (-self.TRANS_DIFF_Y <= pts_trans[:, 1]) & (pts_trans[:, 1] <= self.TRANS_DIFF_Y)
+            pts_trans /= self.POINTS_RADIUS
+            pts_trans[:, 0] *= -1 # TM: X is inverted.
+
+            mesh_indexes = self.mesh_kdt.query(pts_trans, return_distance = False).reshape(-1) # to what mesh point was each pts_trans matched.
+            mesh_visited = np.zeros((*self.qnet.imsize, self.CNT_REPLAYS), dtype = np.bool_)
+
+            for tag, mesh_ind in zip(map(int, pts_replay_tags[mask_close_y]), mesh_indexes[mask_close_y]):
+                ind_x = mesh_ind // (self.qnet.imsize[1] * self.qnet.imsize[2])
+                ind_y = mesh_ind % (self.qnet.imsize[1] * self.qnet.imsize[2]) // self.qnet.imsize[2]
+                ind_z = mesh_ind % (self.qnet.imsize[1] * self.qnet.imsize[2]) % self.qnet.imsize[2]
+
+                if not mesh_visited[ind_x, ind_y, ind_z, tag]:
+                    mesh_visited[ind_x, ind_y, ind_z, tag] = True
+                    state_im[0, ind_x, ind_y, ind_z] += 1
+
+            state_im /= self.CNT_REPLAYS
 
         self.state_ims.append(state_im)
         if len(self.actions) > 1:
             # we will put the latest Transition only when we finish the episode, we want to mark the next state as None, and optionally increase the reward.
             self.replay_buffer.append(Transition(self.state_ims[-3], self.actions[-2], self.rewards[-2], self.state_ims[-2]))
 
-        is_state_too_bad = False  # e.g. too far from other racing lines or too much time has passed <=> self.states array length is too big.
-        if len(self.states) * utils.GAP_TIME > utils.MAX_TIME:
+        is_state_too_bad = False
+        # e.g. too far from other racing lines or too much time has passed <=> self.states array length is too big.
+        # or too far away from any replay point.
+        if len(self.states) * utils.GAP_TIME > utils.MAX_TIME or len(indexes) == 0:
             is_state_too_bad = True
 
         if is_state_too_bad:
@@ -269,7 +278,7 @@ class Agent:
     The caller will access our internal self.actions list for further use.
     """
     def next_action(self):
-        if len(self.actions[0]) % self.CNT_REPEATING_ACTIONS:
+        if len(self.actions) % self.CNT_REPEATING_ACTIONS:
             # just copy the last action.
             self.actions.append(self.actions[-1])
         else:
