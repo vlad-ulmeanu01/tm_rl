@@ -8,7 +8,7 @@ import copy
 import time
 import sys
 
-import agent_qnet
+import agent_qnet_conv
 import utils
 
 
@@ -16,7 +16,7 @@ class MainClient(Client):
     def __init__(self):
         super().__init__()
 
-        self.agent = agent_qnet.Agent()
+        self.agent = agent_qnet_conv.Agent()
         self.remembered_state = None
 
     def on_registered(self, iface: TMInterface):
@@ -58,9 +58,9 @@ class MainClient(Client):
                 # we change the event buffer data to account for the new action.
                 iface.set_input_state(
                     sim_clear_buffer = True,
-                    steer = self.agent.actions[utils.IND_STEER][-1],
-                    accelerate = self.agent.actions[utils.IND_GAS][-1],
-                    brake = self.agent.actions[utils.IND_BRAKE][-1]
+                    steer = self.agent.actions[-1][utils.IND_STEER],
+                    accelerate = self.agent.actions[-1][utils.IND_GAS],
+                    brake = self.agent.actions[-1][utils.IND_BRAKE]
                 )
 
 

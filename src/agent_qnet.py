@@ -63,7 +63,7 @@ def compute_best_action_q(params, s_mean: jnp.array, s_std: jnp.array, s):
 class Agent:
     def __init__(self):
         self.states = []  # the states through which we have gone through during the current episode.
-        self.actions = ([], [], [])  # the actions that we have chosen during the episode.
+        self.actions = []  # the actions that we have chosen during the episode. TODO change to array of tuples before reusing.
         self.agent_wants_new_episode = False
 
         self.episode_ind = 1  # the id of the current episode. 1-indexed.
@@ -128,7 +128,7 @@ class Agent:
     """
     def clear_episode(self):
         self.states = []
-        self.actions = ([], [], [])
+        self.actions = []
         self.episode_ind += 1
         self.visited_replay_state.fill(-1)
 
@@ -137,18 +137,18 @@ class Agent:
     This should compute intermediate rewards and update the Q table.
     """
     def qlearn_update(self, did_episode_end_normally: bool):
-        _, indexes = self.kdt.query(self.states[: len(self.actions[0])-1], k = self.TOPK_CLOSEST)
+        _, indexes = self.kdt.query(self.states[: len(self.actions)-1], k = self.TOPK_CLOSEST)
 
-        for i in range(len(self.actions[0]) - 1):
+        for i in range(len(self.actions) - 1):
             for j in range(self.TOPK_CLOSEST):
                 if self.visited_replay_state[indexes[i, j]] == -1:
                     self.visited_replay_state[indexes[i, j]] = i
 
         running_loss = 0.0
-        for i in range(len(self.actions[0]) - 1, -1, -1):
-            s, a = self.states[i], (self.actions[utils.IND_STEER][i], self.actions[utils.IND_GAS][i], self.actions[utils.IND_BRAKE][i])
+        for i in range(len(self.actions) - 1, -1, -1):
+            s, a = self.states[i], self.actions[i]
 
-            if i + 1 == len(self.actions[0]):
+            if i + 1 == len(self.actions):
                 last_reward = int(utils.MAX_TIME // utils.GAP_TIME) - (len(self.states) - 1) if did_episode_end_normally else 0
                 expected_q = np.float32(last_reward)  # Q(s, a) <- (1 - lr) * Q(s, a) + lr * last_reward
             else:
@@ -165,7 +165,7 @@ class Agent:
             self.qnet_params, loss = qnet_loss_backward(self.qnet_params, self.s_mean, self.s_std, 1e-3, s, a, expected_q)
             running_loss += loss
 
-        running_loss /= len(self.actions[0])
+        running_loss /= len(self.actions)
         print(f"avg running_loss = {round(running_loss, 3)}")
 
         self.LR *= self.RATE_UPD
@@ -223,10 +223,9 @@ class Agent:
     The caller will access our internal self.actions list for further use.
     """
     def next_action(self):
-        if len(self.actions[0]) % self.CNT_REPEATING_ACTIONS:
+        if len(self.actions) % self.CNT_REPEATING_ACTIONS:
             # just copy the last action.
-            for ind in [utils.IND_STEER, utils.IND_GAS, utils.IND_BRAKE]:
-                self.actions[ind].append(self.actions[ind][-1])
+            self.actions.append(self.actions[-1])
         else:
             best_gas = utils.VAL_GAS  # random.choice(utils.VALUES_GAS)
             best_brake = utils.VAL_NO_BRAKE  # random.choice(utils.VALUES_BRAKE)
@@ -236,6 +235,4 @@ class Agent:
             else:
                 best_steer = compute_best_action_q(self.qnet_params, self.s_mean, self.s_std, self.states[-1])[0]
 
-            self.actions[utils.IND_STEER].append(best_steer)
-            self.actions[utils.IND_GAS].append(best_gas)
-            self.actions[utils.IND_BRAKE].append(best_brake)
+            self.actions.append((best_steer, best_gas, best_brake))
