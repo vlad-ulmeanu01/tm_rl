@@ -7,6 +7,7 @@ import math
 GAP_TIME = 10 # ms, length of one timestep.
 PROCESSED_OUTPUT_DIR_PREFIX = "../processed_outputs/output_"
 PARTIAL_OUTPUT_DIR_PREFIX = "../qnet_conv_outputs/partial_"
+LOG_OUTPUT_DIR_PREFIX = "../logs/"
 FIGURES_OUTPUT_DIR_PREFIX = "../figures/"
 QNET_OUTPUT_DIR_PREFIX = "../qnet_conv_outputs/"
 
@@ -89,3 +90,7 @@ def transform_about(pts, new_origin):
 
     mat = matRoll @ matPitch @ matYaw @ matTrans
     return (mat @ np.vstack([pts.T, np.ones(pts.shape[0])]))[:3, :].T
+
+# returns True if a and b (angle measures in radians) are at most diff apart. a and b are in [-math.pi, math.pi].
+def radian_distance(a, b, diff):
+    return min([abs(a - b), abs(a - 2*math.pi - b), abs(a + 2*math.pi - b)]) < diff

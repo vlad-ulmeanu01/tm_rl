@@ -18,12 +18,13 @@ import utils
 
 class DQN(torch.nn.Module):
     # (for now) the state is represented by the 3D minimap (X = 19, Y = 9, Z = 19) of the surroundings of the car, +Z represents its walking direction.
-    # the network outputs the estimates for Q(s, a) for all 12 possible actions.
+    # the network outputs the estimates for Q(s, a) for all 12 possible actions (3 for now, only for STEER).
     def __init__(self):
         super(DQN, self).__init__()
 
         self.imsize = (19, 9, 19)
 
+        # TODO: more out channels, pooling? revert from utils.VALUES_STEER to utils.VALUES_ACTIONS.
         self.conv = torch.nn.Conv3d(in_channels = 1, out_channels = 4, kernel_size = (3, 3, 3))
         self.conv_relu = torch.nn.ReLU()
 
@@ -32,7 +33,7 @@ class DQN(torch.nn.Module):
         self.fc_layers = torch.nn.Sequential(
             torch.nn.Linear(fc_insize, 32),
             torch.nn.ReLU(),
-            torch.nn.Linear(32, len(utils.VALUES_ACTIONS))
+            torch.nn.Linear(32, len(utils.VALUES_STEER))
         )
 
     # state_im should have a shape of [batch_size, in_channels = 1, *self.imsize].
@@ -72,10 +73,19 @@ class Agent:
         self.LR = 1e-3 # DQN learning rate.
         self.REPLAY_BUFSIZE = 2 * 10 ** 4
 
-        self.REWARD_RADIUS = 1 # only attempt to reward replay points that are this close to the current position.
-        self.REWARD_COEF = 0.25
-        self.REWARD_MAX_EXPONENT = 5
-        self.REWARD_MIN_FRAME = 100
+        # first active reward:
+        self.REWARD1_TOPK_CLOSEST = 3 * self.CNT_REPLAYS
+        self.REWARD1_SPREAD = 3.0
+        self.REWARD1_SPREAD_SQ_2X_INV = 1 / (2 * self.REWARD1_SPREAD ** 2)  # the smaller the spread, the closer the agent needs to be to a point to get the same reward.
+        self.REWARD1_COEF = 5.0  # r(s, a) = REWARD_COEF * f(s, a).
+
+        # second active reward:
+        self.REWARD2_RADIUS = 1 # only attempt to reward replay points that are this close to the current position.
+        self.REWARD2_COEF = 0.1
+        self.REWARD2_MAX_EXPONENT = 1
+        self.REWARD2_MIN_FRAME = 100
+        self.REWARD2_YPR_RADIAN_DIFF = math.pi / 12 # will only count a point if the orientation is at most 15 degrees away in any axis.
+        self.REWARD2_WEIGHT_START, self.REWARD2_WEIGHT_END, self.REWARD2_WEIGHT_DECAY = 0.1, 1.0, 500 # this should play a bigger role in later episodes.
 
         self.DISCOUNT_FACTOR = 0.995
         self.EPSILON_START, self.EPSILON_END, self.EPSILON_DECAY = 0.9, 0.05, 500 # epsilon greedy policy.
@@ -84,12 +94,13 @@ class Agent:
         # hyperparameters end.
 
         self.replays_states_actions = []
+        self.rsa_ht = {"x": 0, "y": 1, "z": 2, "yaw": 3, "pitch": 4, "roll": 5, "steer": 6, "gas": 7, "brake": 8, "replay_index": 9, "replay_id": 10}
         for eid, entry in zip(itertools.count(), os.scandir(utils.REPLAYS_DIR)):
             if entry.is_file():
                 df = pd.read_csv(entry.path, skipinitialspace = True)
-                df = df.astype({c: np.float32 for c in df.select_dtypes(include='float64').columns})
+                df = df.astype({c: np.float32 for c in df.select_dtypes(include="float64").columns})
 
-                self.replays_states_actions.append(df[['x', 'y', 'z', 'yaw', 'pitch', 'roll', 'steer', 'gas', 'brake']][1:].to_numpy())
+                self.replays_states_actions.append(df[["x", "y", "z", "yaw", "pitch", "roll", "steer", "gas", "brake"]][1:].to_numpy())
 
                 # append another two columns:
                 # * index of the (state, action) in the replay, used when computing the reward. (e.g. a column with 0/1/2/...)
@@ -102,17 +113,20 @@ class Agent:
 
         self.replays_states_actions = np.vstack(self.replays_states_actions)
 
-        for i in range(self.replays_states_actions.shape[0]):  # stochastically map all steer values which aren't full left/right or center to one of those.
-            steer = self.replays_states_actions[i, 6 + utils.IND_STEER]
+        for i in range(len(self.replays_states_actions)):  # stochastically map all steer values which aren't full left/right or center to one of those.
+            steer = self.replays_states_actions[i, self.rsa_ht["steer"]]
             if steer not in utils.VALUES_STEER:
                 sign = 1 if steer > 0 else -1
                 steer *= sign
                 steer = utils.VAL_STEER_RIGHT if random.random() < steer / utils.VAL_STEER_RIGHT else 0
-                self.replays_states_actions[i, 6 + utils.IND_STEER] = steer * sign
+                self.replays_states_actions[i, self.rsa_ht["steer"]] = steer * sign
 
-        self.replays_kdt = KDTree(self.replays_states_actions[:, :3])
-        self.visited_replay_state = np.zeros(self.replays_states_actions.shape[0], dtype = np.int32)  # will not count towards a reward the same replay state twice in the same episode.
-        self.visited_replay_state.fill(-1)
+        self.replays_kdt = KDTree(self.replays_states_actions[:, [self.rsa_ht["x"], self.rsa_ht["y"], self.rsa_ht["z"]]])
+
+        # will not count towards a reward the same replay state twice in the same episode.
+        # need two rows because we use two types of active rewards, the first for choosing similar actions in similar positions,
+        # and second for arriving to a replay position faster than the replay did.
+        self.visited_replay_state = np.zeros((2, len(self.replays_states_actions)), dtype = np.bool_)
 
         cent_x_half = (np.logspace(0, 1, 10) - 1) / 9; cent_x = np.concatenate([-cent_x_half[1:][::-1], cent_x_half])
         cent_y = np.linspace(-1, 1, 9)
@@ -138,7 +152,8 @@ class Agent:
         self.qnet_optimizer = torch.optim.Adam(self.qnet.parameters())
 
         self.dbg_tstart = time.time()
-        self.dbg_time_spent = {"receive_new_state": 0.0, "rns_kdt": 0.0, "rns_trans": 0.0, "rns_mesh1": 0.0, "rns_mesh2": 0.0, "next_action": 0.0}
+        self.dbg_log = open(f"{utils.LOG_OUTPUT_DIR_PREFIX}qnet_conv_{int(self.dbg_tstart)}_rewards.txt", "w")
+        self.dbg_ht = {"receive_new_state": 0.0, "next_action": 0.0, "sum_reward_passive": 0.0, "sum_reward_active1": 0.0, "sum_reward_active2": 0.0}
 
         # self.dbg_fig, self.dbg_ax = plt.subplots(2, 2, figsize = (10, 5))
 
@@ -162,8 +177,8 @@ class Agent:
         self.actions = []
         self.rewards = []
         self.episode_ind += 1
-        self.visited_replay_state.fill(-1)
-        self.dbg_time_spent = {x: 0.0 for x in self.dbg_time_spent}
+        self.visited_replay_state.fill(False)
+        self.dbg_ht = {x: 0.0 for x in self.dbg_ht}
 
     """
     We call this from episode_ended().
@@ -180,7 +195,7 @@ class Agent:
 
             state_im_batch = torch.stack([transition.state_im for transition in samples]) # shape: [batch_size, 1, 19, 9, 19].
             next_state_im_batch_nonfinal = torch.stack([transition.next_state_im for transition in samples if transition.next_state_im is not None]) # shape: [<= batch_size, 1, 19, 9, 19].
-            state_action_values = self.qnet(state_im_batch) # shape: [batch_size, 12].
+            state_action_values = self.qnet(state_im_batch) # shape: [batch_size, 12] (for now: [batch_size, 3]).
 
             with torch.no_grad():
                 next_state_action_values_nonfinal = self.qnet(next_state_im_batch_nonfinal).max(dim = 1).values
@@ -188,7 +203,8 @@ class Agent:
 
                 nonfinal_id = 0
                 for batch_id in range(self.BATCH_SIZE):
-                    action_id = utils.ACTION_INDEX_HT[samples[batch_id].action]
+                    # action_id = utils.ACTION_INDEX_HT[samples[batch_id].action]
+                    action_id = utils.VALUES_STEER.index(samples[batch_id].action[utils.IND_STEER])
 
                     # we only modify action_id's expected value, because it's the only action that we actually did in the episode.
                     if samples[batch_id].next_state_im is None:
@@ -216,23 +232,20 @@ class Agent:
     """
     def episode_ended(self, did_episode_end_normally: bool):
         if did_episode_end_normally:
-            self.rewards[-1] += utils.MAX_TIME - (len(self.states) - 1)
+            self.rewards[-1] += utils.MAX_TIME // utils.GAP_TIME - (len(self.states) - 1)
 
-        # we add the last transition from the episode in the buffer. We mark the next state as None to recall its Q(s, .) as 0.
-        if len(self.state_ims) >= 2:
-            self.replay_buffer.append(Transition(self.state_ims[-2], self.actions[-1], self.rewards[-1], None))
+        # we pull all self.replay_buffer updates here.
+        for i in range(0, len(self.actions), self.CNT_REPEATING_ACTIONS):
+            j = i + self.CNT_REPEATING_ACTIONS
+            self.replay_buffer.append(Transition(self.state_ims[i], self.actions[i], sum(self.rewards[i: j]), self.state_ims[j] if j < len(self.states) else None))
 
         print(f"Episode {self.episode_ind}:")
         print(f"Rewards: min = {round(min(self.rewards), 3)}, avg = {round(sum(self.rewards) / len(self.rewards), 3)}, max = {round(max(self.rewards), 3)}, sum = {round(sum(self.rewards), 3)}")
-        print(f"Time from start: {round(time.time() - self.dbg_tstart, 3)}, this episode in receive_new_state: {round(self.dbg_time_spent['receive_new_state'], 3)}, next_action: {round(self.dbg_time_spent['next_action'], 3)}")
-        # print(f"rns_kdt: {round(self.dbg_time_spent['rns_kdt'], 3)}, rns_trans: {round(self.dbg_time_spent['rns_trans'], 3)}, rns_mesh1: {round(self.dbg_time_spent['rns_mesh1'], 3)}, rns_mesh2: {round(self.dbg_time_spent['rns_mesh2'], 3)}")
+        print(f"Rewards: passive: {round(self.dbg_ht['sum_reward_passive'], 3)}, active 1: {round(self.dbg_ht['sum_reward_active1'], 3)}, active 2: {round(self.dbg_ht['sum_reward_active2'], 3)}")
+        print(f"Time from start: {round(time.time() - self.dbg_tstart, 3)}, this episode in receive_new_state: {round(self.dbg_ht['receive_new_state'], 3)}, next_action: {round(self.dbg_ht['next_action'], 3)}")
 
-        # self.dbg_ax[0, 0].clear(); self.dbg_ax[0, 1].clear(); self.dbg_ax[1, 0].clear(); self.dbg_ax[1, 1].clear()
-        # self.dbg_ax[0, 0].plot(self.rewards); self.dbg_ax[0, 0].set_title(f"Reward plot for episode {self.episode_ind}")
-        # self.dbg_ax[0, 1].plot([steer for steer, _, _ in self.actions]); self.dbg_ax[0, 1].set_title("Steer")
-        # self.dbg_ax[1, 0].plot([gas for  _, gas, _ in self.actions]); self.dbg_ax[0, 1].set_title("Gas")
-        # self.dbg_ax[1, 1].plot([brake for _, _, brake in self.actions]); self.dbg_ax[0, 1].set_title("Brake")
-        # self.dbg_fig.savefig(f"{utils.FIGURES_OUTPUT_DIR_PREFIX}fig_{int(self.dbg_tstart)}_{self.episode_ind}.png", bbox_inches = "tight")
+        self.dbg_log.write(' '.join(map(str, np.round(self.rewards, 3))) + "\n")
+        self.dbg_log.flush()
 
         self.qlearn_update()
 
@@ -266,44 +279,45 @@ class Agent:
 
         # compute the new image state state_im here.
         state_im = np.zeros((1, *self.qnet.imsize), dtype = np.float32) # 1 = in_channels.
+        away_from_replays = False
 
-        new_origin = (state[utils.IND_X], state[utils.IND_Y], state[utils.IND_Z], state[utils.IND_YAW], state[utils.IND_PITCH], state[utils.IND_ROLL])
-        indexes = self.replays_kdt.query_radius([new_origin[:3]], r = self.POINTS_RADIUS)[0]
+        if len(self.actions) % self.CNT_REPEATING_ACTIONS == 0: # we actually have to compute the next action, so state_im matters as input for the network.
+            new_origin = (state[utils.IND_X], state[utils.IND_Y], state[utils.IND_Z], state[utils.IND_YAW], state[utils.IND_PITCH], state[utils.IND_ROLL])
+            indexes = self.replays_kdt.query_radius([new_origin[:3]], r = self.POINTS_RADIUS)[0]
 
-        if len(indexes):
-            pts_trans = utils.transform_about(self.replays_states_actions[indexes, :3], new_origin)
-            pts_replay_tags = self.replays_states_actions[indexes, -1] # need to know for each selected point from which replay was it chosen.
+            if len(indexes):
+                pts_trans = utils.transform_about(self.replays_states_actions[np.ix_(indexes, [self.rsa_ht["x"], self.rsa_ht["y"], self.rsa_ht["z"]])], new_origin)
+                pts_replay_tags = self.replays_states_actions[indexes, self.rsa_ht["replay_id"]] # need to know for each selected point from which replay was it chosen.
 
-            mask_close_y = (-self.TRANS_DIFF_Y <= pts_trans[:, 1]) & (pts_trans[:, 1] <= self.TRANS_DIFF_Y)
-            pts_trans /= self.POINTS_RADIUS
-            pts_trans[:, 0] *= -1 # TM: X is inverted.
+                mask_close_y = (-self.TRANS_DIFF_Y <= pts_trans[:, 1]) & (pts_trans[:, 1] <= self.TRANS_DIFF_Y)
+                pts_trans /= self.POINTS_RADIUS
+                pts_trans[:, 0] *= -1 # TM: X is inverted.
 
-            if sum(mask_close_y):
-                # TODO this if needs to be (again) sped up.
-                mesh_indexes = self.mesh_kdt.query(pts_trans[mask_close_y], return_distance = False).reshape(-1) # to what mesh point was each pts_trans matched.
+                if sum(mask_close_y):
+                    # TODO this if needs to be (again) sped up.
+                    mesh_indexes = self.mesh_kdt.query(pts_trans[mask_close_y], return_distance = False).reshape(-1) # to what mesh point was each pts_trans matched.
 
-                mesh_visited = np.zeros((*self.qnet.imsize, self.CNT_REPLAYS), dtype = np.bool_)
-                for tag, mesh_ind in zip(map(int, pts_replay_tags[mask_close_y]), mesh_indexes):
-                    ind_x, ind_y, ind_z = self.mesh_id_to_loc[mesh_ind]
-                    if not mesh_visited[ind_x, ind_y, ind_z, tag]:
-                        mesh_visited[ind_x, ind_y, ind_z, tag] = True
-                        state_im[0, ind_x, ind_y, ind_z] += 1
+                    mesh_visited = np.zeros((*self.qnet.imsize, self.CNT_REPLAYS), dtype = np.bool_)
+                    for tag, mesh_ind in zip(map(int, pts_replay_tags[mask_close_y]), mesh_indexes):
+                        ind_x, ind_y, ind_z = self.mesh_id_to_loc[mesh_ind]
+                        if not mesh_visited[ind_x, ind_y, ind_z, tag]:
+                            mesh_visited[ind_x, ind_y, ind_z, tag] = True
+                            state_im[0, ind_x, ind_y, ind_z] += 1
 
-                state_im /= self.CNT_REPLAYS
+                    state_im /= self.CNT_REPLAYS
+            else:
+                away_from_replays = True
 
         self.state_ims.append(torch.tensor(state_im))
-        if len(self.actions) > 1:
-            # we will put the latest Transition only when we finish the episode, we want to mark the next state as None, and optionally increase the reward.
-            self.replay_buffer.append(Transition(self.state_ims[-3], self.actions[-2], self.rewards[-2], self.state_ims[-2]))
 
         is_state_too_bad = False
         # e.g. too far from other racing lines or too much time has passed <=> self.states array length is too big.
         # or too far away from any replay point.
-        if len(self.states) * utils.GAP_TIME > utils.MAX_TIME or len(indexes) == 0:
+        if len(self.states) * utils.GAP_TIME > utils.MAX_TIME or away_from_replays:
             is_state_too_bad = True
 
         # print(f"dbg receive_new_state, spent {round(time.time() - tstart, 3)}, {len(indexes) = }.")
-        self.dbg_time_spent["receive_new_state"] += time.time() - tstart
+        self.dbg_ht["receive_new_state"] += time.time() - tstart
 
         if is_state_too_bad:
             self.want_new_episode()
@@ -332,26 +346,51 @@ class Agent:
             else:
                 with torch.no_grad(): # we need to unsqueeze for batch_size = 1.
                     # best_steer, best_gas, best_brake = utils.VALUES_ACTIONS[self.qnet(self.state_ims[-1].unsqueeze(dim = 0))[0].argmax().item()]
-                    best_steer, _, _ = utils.VALUES_ACTIONS[self.qnet(self.state_ims[-1].unsqueeze(dim = 0))[0].argmax().item()]
+                    best_steer = utils.VALUES_STEER[self.qnet(self.state_ims[-1].unsqueeze(dim = 0))[0].argmax().item()]
 
             self.actions.append((best_steer, best_gas, best_brake))
 
         # since we just computed the next action, we can also compute the reward given here as well.
-        reward = 0
+        reward0 = 0
 
-        if len(self.states) > 1: # constant reward: distance travelled between the last two states.
-            reward += np.linalg.norm(np.array(self.states[-1][:3], dtype = np.float32) - np.array(self.states[-2][:3], dtype = np.float32))
+        # passive reward: distance travelled between the last two states. only count for X/Z, as we need to prevent falling from the map as a reward.
+        if len(self.states) > 1:
+            reward0 += np.linalg.norm(np.array(self.states[-1][:3], dtype = np.float32)[[utils.IND_X, utils.IND_Z]] - np.array(self.states[-2][:3], dtype = np.float32)[[utils.IND_X, utils.IND_Z]])
 
-        indexes = self.replays_kdt.query_radius([self.states[-1][:3]], r = self.REWARD_RADIUS)[0]
-        frame_at_replay = self.replays_states_actions[indexes, -2] # at what frame in the replay does the replay hit the close point.
+        # active reward 1: award actions similar to ones taken by replays close by.
+        indexes = self.replays_kdt.query([self.states[-1][:3]], k = self.REWARD1_TOPK_CLOSEST, return_distance = False)[0]
+        z = np.exp(- np.linalg.norm(self.replays_states_actions[np.ix_(indexes, [self.rsa_ht["x"], self.rsa_ht["y"], self.rsa_ht["z"]])] - self.states[-1][:3], axis = 1)
+                   * self.REWARD1_SPREAD_SQ_2X_INV)
+
+        reward1 = self.REWARD1_COEF * sum([
+            z[j] for j in range(self.REWARD1_TOPK_CLOSEST) if not self.visited_replay_state[0, indexes[j]] and
+                                                              all(self.replays_states_actions[indexes[j], [self.rsa_ht["steer"], self.rsa_ht["gas"], self.rsa_ht["brake"]]] == self.actions[-1])
+        ]) / self.REWARD1_TOPK_CLOSEST
+
+        self.visited_replay_state[0, indexes] = True
+
+        # active reward 2: award if location is close to replay point, but we got there quicker than the replay.
+        reward2 = 0
+
+        indexes = self.replays_kdt.query_radius([self.states[-1][:3]], r = self.REWARD2_RADIUS)[0]
+        frame_at_replay = self.replays_states_actions[indexes, self.rsa_ht["replay_index"]]  # at what frame in the replay does the replay hit the close point.
         for ind, replay_frame in zip(indexes, frame_at_replay):
-            if replay_frame >= self.REWARD_MIN_FRAME and self.visited_replay_state[ind] == -1:
-                self.visited_replay_state[ind] = 0
+            if replay_frame >= self.REWARD2_MIN_FRAME and not self.visited_replay_state[1, ind] and\
+                utils.radian_distance(self.states[-1][utils.IND_YAW], self.replays_states_actions[ind, self.rsa_ht["yaw"]], self.REWARD2_YPR_RADIAN_DIFF) and\
+                utils.radian_distance(self.states[-1][utils.IND_PITCH], self.replays_states_actions[ind, self.rsa_ht["pitch"]], self.REWARD2_YPR_RADIAN_DIFF) and\
+                utils.radian_distance(self.states[-1][utils.IND_ROLL], self.replays_states_actions[ind, self.rsa_ht["roll"]], self.REWARD2_YPR_RADIAN_DIFF):
+                self.visited_replay_state[1, ind] = True
                 frame = len(self.states) - 1
 
                 # we reward an agent if it reaches a state faster than a replay. we only reward him at most once per replay point per episode.
-                reward += math.exp(min(self.REWARD_MAX_EXPONENT, (replay_frame - frame) * self.REWARD_COEF))
+                reward2 += math.exp(min(self.REWARD2_MAX_EXPONENT, (replay_frame - frame) * self.REWARD2_COEF))
 
-        self.rewards.append(reward)
+        r2_coef = self.REWARD2_WEIGHT_START + (self.REWARD2_WEIGHT_END - self.REWARD2_WEIGHT_START) * (1 - math.exp(-self.episode_ind / self.REWARD2_WEIGHT_DECAY))
+        reward2 *= r2_coef
 
-        self.dbg_time_spent["next_action"] += time.time() - tstart
+        self.rewards.append(reward0 + reward1 + reward2)
+
+        self.dbg_ht["sum_reward_passive"] += reward0
+        self.dbg_ht["sum_reward_active1"] += reward1
+        self.dbg_ht["sum_reward_active2"] += reward2
+        self.dbg_ht["next_action"] += time.time() - tstart

@@ -7,7 +7,7 @@ import utils
 class Agent:
     def __init__(self):
         self.states = [] # the states through which we have gone through during the current episode.
-        self.actions = ([], [], []) # the actions that we have chosen during the episode.
+        self.actions = [] # the actions that we have chosen during the episode.
 
         self.agent_wants_new_episode = False
 
@@ -27,7 +27,7 @@ class Agent:
     """
     def clear_episode(self):
         self.states = []
-        self.actions = ([], [], [])
+        self.actions = []
 
     """
     Called by the client to give us a new state. Is called by the client because we either: 
@@ -74,6 +74,4 @@ class Agent:
         gas = utils.VAL_GAS if random.randint(0, 99) < 99 else utils.VAL_NO_GAS
         brake = utils.VAL_NO_BRAKE if random.randint(0, 99) < 99 else utils.VAL_BRAKE
 
-        self.actions[utils.IND_STEER].append(steer)
-        self.actions[utils.IND_GAS].append(gas)
-        self.actions[utils.IND_BRAKE].append(brake)
+        self.actions.append((steer, gas, brake))
