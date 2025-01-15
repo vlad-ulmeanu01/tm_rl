@@ -25,23 +25,23 @@ class DQN(torch.nn.Module):
         self.imsize = (19, 9, 19)
 
         # TODO: more out channels, pooling? revert from utils.VALUES_STEER to utils.VALUES_ACTIONS.
-        self.conv = torch.nn.Conv3d(in_channels = 1, out_channels = 4, kernel_size = (3, 3, 3))
+        self.conv = torch.nn.Conv3d(in_channels = 1, out_channels = 24, kernel_size = (3, 3, 3))
+        self.pool = torch.nn.MaxPool3d(kernel_size = (2, 2, 2))
         self.conv_relu = torch.nn.ReLU()
 
-        fc_insize = np.product([ims - ks + 1 for ims, ks in zip(self.imsize, self.conv.kernel_size)])
+        fc_insize = np.product([(ims - ks_c + 1) // ks_p for ims, ks_c, ks_p in zip(self.imsize, self.conv.kernel_size, self.pool.kernel_size)])
 
         self.fc_layers = torch.nn.Sequential(
-            torch.nn.Linear(fc_insize, 32),
+            torch.nn.Linear(fc_insize, 128),
             torch.nn.ReLU(),
-            torch.nn.Linear(32, len(utils.VALUES_STEER))
+            torch.nn.Linear(128, len(utils.VALUES_STEER))
         )
 
     # state_im should have a shape of [batch_size, in_channels = 1, *self.imsize].
     def forward(self, state_im: torch.tensor):
         # conv(x)'s shape is [batch_size, out_channels, ??, ??, ??], channel avg conv <=> mean on dim 1. we view to flatten everything but the batch size.
-        out = self.conv_relu(self.conv(state_im).mean(dim = 1).view(state_im.shape[0], -1))
-        for layer in self.fc_layers:
-            out = layer(out)
+        out = self.conv_relu(self.pool(self.conv(state_im)).mean(dim = 1).view(state_im.shape[0], -1))
+        out = self.fc_layers(out)
         return out
 
 
@@ -76,19 +76,21 @@ class Agent:
         # first active reward:
         self.REWARD1_TOPK_CLOSEST = 3 * self.CNT_REPLAYS
         self.REWARD1_SPREAD = utils.DecayScheduler(start = 5.0, end = 1.0, decay = 500)  # the smaller the spread, the closer the agent needs to be to a point to get the same reward.
-        self.REWARD1_COEF = 5.0  # r(s, a) = REWARD_COEF * f(s, a).
+        self.REWARD1_COEF = 10.0  # r(s, a) = REWARD_COEF * f(s, a).
 
         # second active reward:
         self.REWARD2_RADIUS = 1 # only attempt to reward replay points that are this close to the current position.
         self.REWARD2_COEF = 0.1
         self.REWARD2_MAX_EXPONENT = 1
         self.REWARD2_MIN_FRAME = 100
-        self.REWARD2_YPR_RADIAN_DIFF = math.pi / 12 # will only count a point if the orientation is at most 15 degrees away in any axis.
+        self.REWARD2_YPR_RADIAN_DIFF = math.pi / 24 # will only count a point if the orientation is at most ?? degrees away in any axis.
         self.REWARD2_SCHEDULER = utils.DecayScheduler(start = 0.1, end = 1.0, decay = 500) # this should play a bigger role in later episodes.
 
         self.PASSIVE_REWARD_MAX_BAD_STREAK = 100
         self.PASSIVE_REWARD_BAD_STREAK_BOUND = 1e-2 # if the car moves less than ?? per frame for 100 consecutive frames, cancel the episode.
-        self.REWARD_END_EPISODE_COEF = 10.0
+
+        self.REWARD_END_EPISODE_COEF_START = 10.0 # (time - utils.BONUS_TIME_START) / (utils.BONUS_TIME_END - utils.BONUS_TIME_START) == (end - bonus) / (end - start).
+        self.REWARD_END_EPISODE_COEF_END = 30.0
 
         self.DISCOUNT_FACTOR = 0.995
         self.EPSILON_SCHEDULER = utils.DecayScheduler(start = 0.9, end = 0.05, decay = 500) # epsilon greedy policy.
@@ -154,7 +156,7 @@ class Agent:
 
         self.qnet = DQN()
         self.qnet_criterion = torch.nn.SmoothL1Loss()
-        self.qnet_optimizer = torch.optim.Adam(self.qnet.parameters())
+        self.qnet_optimizer = torch.optim.Adam(self.qnet.parameters(), lr = self.LR)
 
         self.dbg_tstart = time.time()
         self.dbg_reward_log = open(f"{utils.LOG_OUTPUT_DIR_PREFIX}qnet_conv_{int(self.dbg_tstart)}_rewards.txt", "w")
@@ -239,9 +241,14 @@ class Agent:
     """
     def episode_ended(self, did_episode_end_normally: bool):
         if did_episode_end_normally:
-            self.rewards[-1] += self.REWARD_END_EPISODE_COEF * (utils.MAX_TIME // utils.GAP_TIME - (len(self.states) - 1))
-        # else:
-        #     self.rewards[-1] -= utils.MAX_TIME // utils.GAP_TIME # TODO posibil sa nu scadem daca e din cauza la timeout? desi nu cred.
+            reward_coef = self.REWARD_END_EPISODE_COEF_START
+            if (len(self.states) - 1) * utils.GAP_TIME <= utils.BONUS_TIME_END:
+                # (time - utils.BONUS_TIME_START) / (utils.BONUS_TIME_END - utils.BONUS_TIME_START) == (end - bonus) / (end - start)
+                t = max((len(self.states) - 1) * utils.GAP_TIME, utils.BONUS_TIME_START)
+                reward_coef = (self.REWARD_END_EPISODE_COEF_END - (t - utils.BONUS_TIME_START) * (self.REWARD_END_EPISODE_COEF_END - self.REWARD_END_EPISODE_COEF_START) /
+                              (utils.BONUS_TIME_END - utils.BONUS_TIME_START))
+
+            self.rewards[-1] += reward_coef * (utils.MAX_TIME // utils.GAP_TIME - (len(self.states) - 1))
 
         # we pull all self.replay_buffer updates here.
         for i in range(0, len(self.actions), self.CNT_REPEATING_ACTIONS):
@@ -379,12 +386,13 @@ class Agent:
         z = np.exp(- np.linalg.norm(self.replays_states_actions[np.ix_(indexes, [self.rsa_ht["x"], self.rsa_ht["y"], self.rsa_ht["z"]])] - self.states[-1][:3], axis = 1)
                    / (2 * self.REWARD1_SPREAD.get(self.episode_ind) ** 2))
 
-        reward1 = self.REWARD1_COEF * sum([
-            z[j] for j in range(self.REWARD1_TOPK_CLOSEST) if not self.visited_replay_state[0, indexes[j]] and
-                                                              all(self.replays_states_actions[indexes[j], [self.rsa_ht["steer"], self.rsa_ht["gas"], self.rsa_ht["brake"]]] == self.actions[-1])
-        ]) / self.REWARD1_TOPK_CLOSEST
+        chosen_js = [
+            j for j in range(self.REWARD1_TOPK_CLOSEST) if not self.visited_replay_state[0, indexes[j]] and
+            all(self.replays_states_actions[indexes[j], [self.rsa_ht["steer"], self.rsa_ht["gas"], self.rsa_ht["brake"]]] == self.actions[-1])
+        ]
 
-        self.visited_replay_state[0, indexes] = True
+        reward1 = self.REWARD1_COEF * sum(z[chosen_js]) / self.REWARD1_TOPK_CLOSEST
+        self.visited_replay_state[0, indexes[chosen_js]] = True # we only mark as visited the replay points which have the same action as self.actions[-1].
 
         # active reward 2: award if location is close to replay point, but we got there quicker than the replay.
         reward2 = 0

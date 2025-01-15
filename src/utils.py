@@ -30,6 +30,8 @@ IND_X, IND_Y, IND_Z, IND_YAW, IND_PITCH, IND_ROLL, IND_VX, IND_VY, IND_VZ, IND_W
 MAX_TIME_INBETWEEN_RUNS = 1.65 # maximum number of seconds that we can do computing between ending an episode and beginning another.
 
 MAX_TIME = 15_000  # maximum number of milliseconds we're willing to run a replay for.
+BONUS_TIME_START = 6_500 # time around what we would want to hit.
+BONUS_TIME_END = 8_000 # we award a reward bonus for tracks finishing between BONUS_TIME_START, BONUS_TIME_END.
 REPLAYS_DIR = "C:\\Users\\ulmea\\Desktop\\Probleme\\Trackmania\\test_date_roti\\RawDataset\\ABC\\A-9_keyboard"
 
 
