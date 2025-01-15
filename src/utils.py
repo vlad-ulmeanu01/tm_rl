@@ -27,10 +27,23 @@ ACTION_INDEX_HT = {action: i for i, action in zip(itertools.count(), VALUES_ACTI
 
 IND_X, IND_Y, IND_Z, IND_YAW, IND_PITCH, IND_ROLL, IND_VX, IND_VY, IND_VZ, IND_WHEEL_MATERIALS, IND_WHEEL_CONTACT = range(11)
 
-MAX_TIME_INBETWEEN_RUNS = 1.5 # maximum number of seconds that we can do computing between ending an episode and beginning another.
+MAX_TIME_INBETWEEN_RUNS = 1.65 # maximum number of seconds that we can do computing between ending an episode and beginning another.
 
 MAX_TIME = 15_000  # maximum number of milliseconds we're willing to run a replay for.
 REPLAYS_DIR = "C:\\Users\\ulmea\\Desktop\\Probleme\\Trackmania\\test_date_roti\\RawDataset\\ABC\\A-9_keyboard"
+
+
+class DecayScheduler:
+    def __init__(self, start: float, end: float, decay: float):
+        self.start = start
+        self.end = end
+        self.decay = decay
+
+    def get(self, episode_ind: int):
+        amt = math.exp(-episode_ind / self.decay)
+        if self.end < self.start:
+            return self.end + (self.start - self.end) * amt
+        return self.start + (self.end - self.start) * (1 - amt)
 
 
 """

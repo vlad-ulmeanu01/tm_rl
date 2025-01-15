@@ -75,8 +75,7 @@ class Agent:
 
         # first active reward:
         self.REWARD1_TOPK_CLOSEST = 3 * self.CNT_REPLAYS
-        self.REWARD1_SPREAD = 3.0
-        self.REWARD1_SPREAD_SQ_2X_INV = 1 / (2 * self.REWARD1_SPREAD ** 2)  # the smaller the spread, the closer the agent needs to be to a point to get the same reward.
+        self.REWARD1_SPREAD = utils.DecayScheduler(start = 5.0, end = 1.0, decay = 500)  # the smaller the spread, the closer the agent needs to be to a point to get the same reward.
         self.REWARD1_COEF = 5.0  # r(s, a) = REWARD_COEF * f(s, a).
 
         # second active reward:
@@ -85,20 +84,26 @@ class Agent:
         self.REWARD2_MAX_EXPONENT = 1
         self.REWARD2_MIN_FRAME = 100
         self.REWARD2_YPR_RADIAN_DIFF = math.pi / 12 # will only count a point if the orientation is at most 15 degrees away in any axis.
-        self.REWARD2_WEIGHT_START, self.REWARD2_WEIGHT_END, self.REWARD2_WEIGHT_DECAY = 0.1, 1.0, 500 # this should play a bigger role in later episodes.
+        self.REWARD2_SCHEDULER = utils.DecayScheduler(start = 0.1, end = 1.0, decay = 500) # this should play a bigger role in later episodes.
+
+        self.PASSIVE_REWARD_MAX_BAD_STREAK = 100
+        self.PASSIVE_REWARD_BAD_STREAK_BOUND = 1e-2 # if the car moves less than ?? per frame for 100 consecutive frames, cancel the episode.
+        self.REWARD_END_EPISODE_COEF = 10.0
 
         self.DISCOUNT_FACTOR = 0.995
-        self.EPSILON_START, self.EPSILON_END, self.EPSILON_DECAY = 0.9, 0.05, 500 # epsilon greedy policy.
+        self.EPSILON_SCHEDULER = utils.DecayScheduler(start = 0.9, end = 0.05, decay = 500) # epsilon greedy policy.
 
         self.CNT_REPEATING_ACTIONS = 20 # will choose a new action every CNT_REPEATING_ACTIONS.
         # hyperparameters end.
+
+        self.passive_reward_bad_streak = 0
 
         self.replays_states_actions = []
         self.rsa_ht = {"x": 0, "y": 1, "z": 2, "yaw": 3, "pitch": 4, "roll": 5, "steer": 6, "gas": 7, "brake": 8, "replay_index": 9, "replay_id": 10}
         for eid, entry in zip(itertools.count(), os.scandir(utils.REPLAYS_DIR)):
             if entry.is_file():
                 df = pd.read_csv(entry.path, skipinitialspace = True)
-                df = df.astype({c: np.float32 for c in df.select_dtypes(include="float64").columns})
+                df = df.astype({c: np.float32 for c in df.select_dtypes(include = "float64").columns})
 
                 self.replays_states_actions.append(df[["x", "y", "z", "yaw", "pitch", "roll", "steer", "gas", "brake"]][1:].to_numpy())
 
@@ -152,7 +157,8 @@ class Agent:
         self.qnet_optimizer = torch.optim.Adam(self.qnet.parameters())
 
         self.dbg_tstart = time.time()
-        self.dbg_log = open(f"{utils.LOG_OUTPUT_DIR_PREFIX}qnet_conv_{int(self.dbg_tstart)}_rewards.txt", "w")
+        self.dbg_reward_log = open(f"{utils.LOG_OUTPUT_DIR_PREFIX}qnet_conv_{int(self.dbg_tstart)}_rewards.txt", "w")
+        self.dbg_log = open(f"{utils.LOG_OUTPUT_DIR_PREFIX}qnet_conv_{int(self.dbg_tstart)}.txt", "w")
         self.dbg_ht = {"receive_new_state": 0.0, "next_action": 0.0, "sum_reward_passive": 0.0, "sum_reward_active1": 0.0, "sum_reward_active2": 0.0}
 
         # self.dbg_fig, self.dbg_ax = plt.subplots(2, 2, figsize = (10, 5))
@@ -176,8 +182,9 @@ class Agent:
         self.state_ims = []
         self.actions = []
         self.rewards = []
-        self.episode_ind += 1
+        self.passive_reward_bad_streak = 0
         self.visited_replay_state.fill(False)
+        self.episode_ind += 1
         self.dbg_ht = {x: 0.0 for x in self.dbg_ht}
 
     """
@@ -232,20 +239,27 @@ class Agent:
     """
     def episode_ended(self, did_episode_end_normally: bool):
         if did_episode_end_normally:
-            self.rewards[-1] += utils.MAX_TIME // utils.GAP_TIME - (len(self.states) - 1)
+            self.rewards[-1] += self.REWARD_END_EPISODE_COEF * (utils.MAX_TIME // utils.GAP_TIME - (len(self.states) - 1))
+        # else:
+        #     self.rewards[-1] -= utils.MAX_TIME // utils.GAP_TIME # TODO posibil sa nu scadem daca e din cauza la timeout? desi nu cred.
 
         # we pull all self.replay_buffer updates here.
         for i in range(0, len(self.actions), self.CNT_REPEATING_ACTIONS):
             j = i + self.CNT_REPEATING_ACTIONS
             self.replay_buffer.append(Transition(self.state_ims[i], self.actions[i], sum(self.rewards[i: j]), self.state_ims[j] if j < len(self.states) else None))
 
-        print(f"Episode {self.episode_ind}:")
-        print(f"Rewards: min = {round(min(self.rewards), 3)}, avg = {round(sum(self.rewards) / len(self.rewards), 3)}, max = {round(max(self.rewards), 3)}, sum = {round(sum(self.rewards), 3)}")
-        print(f"Rewards: passive: {round(self.dbg_ht['sum_reward_passive'], 3)}, active 1: {round(self.dbg_ht['sum_reward_active1'], 3)}, active 2: {round(self.dbg_ht['sum_reward_active2'], 3)}")
-        print(f"Time from start: {round(time.time() - self.dbg_tstart, 3)}, this episode in receive_new_state: {round(self.dbg_ht['receive_new_state'], 3)}, next_action: {round(self.dbg_ht['next_action'], 3)}")
+        for dbg_str in [
+            f"Episode {self.episode_ind}:",
+            f"Rewards: min = {round(min(self.rewards), 3)}, avg = {round(sum(self.rewards) / len(self.rewards), 3)}, max = {round(max(self.rewards), 3)}, sum = {round(sum(self.rewards), 3)}",
+            f"Rewards: passive: {round(self.dbg_ht['sum_reward_passive'], 3)}, active 1: {round(self.dbg_ht['sum_reward_active1'], 3)}, active 2: {round(self.dbg_ht['sum_reward_active2'], 3)}",
+            f"Time from start: {round(time.time() - self.dbg_tstart, 3)}, this episode in receive_new_state: {round(self.dbg_ht['receive_new_state'], 3)}, next_action: {round(self.dbg_ht['next_action'], 3)}"
+        ]:
+            print(dbg_str)
+            self.dbg_log.write(dbg_str + "\n")
+            self.dbg_log.flush()
 
-        self.dbg_log.write(' '.join(map(str, np.round(self.rewards, 3))) + "\n")
-        self.dbg_log.flush()
+        self.dbg_reward_log.write(' '.join(map(str, np.round(self.rewards, 3))) + "\n")
+        self.dbg_reward_log.flush()
 
         self.qlearn_update()
 
@@ -316,7 +330,9 @@ class Agent:
         if len(self.states) * utils.GAP_TIME > utils.MAX_TIME or away_from_replays:
             is_state_too_bad = True
 
-        # print(f"dbg receive_new_state, spent {round(time.time() - tstart, 3)}, {len(indexes) = }.")
+        if self.passive_reward_bad_streak >= self.PASSIVE_REWARD_MAX_BAD_STREAK:
+            is_state_too_bad = True
+
         self.dbg_ht["receive_new_state"] += time.time() - tstart
 
         if is_state_too_bad:
@@ -338,8 +354,7 @@ class Agent:
             best_gas = utils.VAL_GAS
             best_brake = utils.VAL_NO_BRAKE
 
-            eps = self.EPSILON_END + (self.EPSILON_START - self.EPSILON_END) * math.exp(-self.episode_ind / self.EPSILON_DECAY)
-            if random.random() < eps and self.episode_ind % self.dbg_every:
+            if random.random() < self.EPSILON_SCHEDULER.get(self.episode_ind) and self.episode_ind % self.dbg_every:
                 best_steer = random.choice(utils.VALUES_STEER)
                 # best_gas = random.choice(utils.VALUES_GAS)
                 # best_brake = random.choice(utils.VALUES_BRAKE)
@@ -355,12 +370,14 @@ class Agent:
 
         # passive reward: distance travelled between the last two states. only count for X/Z, as we need to prevent falling from the map as a reward.
         if len(self.states) > 1:
-            reward0 += np.linalg.norm(np.array(self.states[-1][:3], dtype = np.float32)[[utils.IND_X, utils.IND_Z]] - np.array(self.states[-2][:3], dtype = np.float32)[[utils.IND_X, utils.IND_Z]])
+            reward0 = np.linalg.norm(np.array(self.states[-1][:3], dtype = np.float32)[[utils.IND_X, utils.IND_Z]] -
+                                     np.array(self.states[-2][:3], dtype = np.float32)[[utils.IND_X, utils.IND_Z]])
+        self.passive_reward_bad_streak = self.passive_reward_bad_streak + 1 if reward0 < self.PASSIVE_REWARD_BAD_STREAK_BOUND else 0
 
         # active reward 1: award actions similar to ones taken by replays close by.
         indexes = self.replays_kdt.query([self.states[-1][:3]], k = self.REWARD1_TOPK_CLOSEST, return_distance = False)[0]
         z = np.exp(- np.linalg.norm(self.replays_states_actions[np.ix_(indexes, [self.rsa_ht["x"], self.rsa_ht["y"], self.rsa_ht["z"]])] - self.states[-1][:3], axis = 1)
-                   * self.REWARD1_SPREAD_SQ_2X_INV)
+                   / (2 * self.REWARD1_SPREAD.get(self.episode_ind) ** 2))
 
         reward1 = self.REWARD1_COEF * sum([
             z[j] for j in range(self.REWARD1_TOPK_CLOSEST) if not self.visited_replay_state[0, indexes[j]] and
@@ -385,8 +402,7 @@ class Agent:
                 # we reward an agent if it reaches a state faster than a replay. we only reward him at most once per replay point per episode.
                 reward2 += math.exp(min(self.REWARD2_MAX_EXPONENT, (replay_frame - frame) * self.REWARD2_COEF))
 
-        r2_coef = self.REWARD2_WEIGHT_START + (self.REWARD2_WEIGHT_END - self.REWARD2_WEIGHT_START) * (1 - math.exp(-self.episode_ind / self.REWARD2_WEIGHT_DECAY))
-        reward2 *= r2_coef
+        reward2 *= self.REWARD2_SCHEDULER.get(self.episode_ind)
 
         self.rewards.append(reward0 + reward1 + reward2)
 
