@@ -10,6 +10,7 @@ PARTIAL_OUTPUT_DIR_PREFIX = "../qnet_conv_outputs/partial_"
 LOG_OUTPUT_DIR_PREFIX = "../logs/"
 FIGURES_OUTPUT_DIR_PREFIX = "../figures/"
 QNET_OUTPUT_DIR_PREFIX = "../qnet_conv_outputs/"
+QNET_LOAD_PTS_DIR = "../qnet_conv_saved_pts/"
 
 IND_STEER, IND_GAS, IND_BRAKE = 0, 1, 2
 
@@ -31,7 +32,7 @@ MAX_TIME_INBETWEEN_RUNS = 1.65 # maximum number of seconds that we can do comput
 
 MAX_TIME = 15_000  # maximum number of milliseconds we're willing to run a replay for.
 BONUS_TIME_START = 6_500 # time around what we would want to hit.
-BONUS_TIME_END = 8_000 # we award a reward bonus for tracks finishing between BONUS_TIME_START, BONUS_TIME_END.
+BONUS_TIME_END = 9_000 # we award a reward bonus for tracks finishing between BONUS_TIME_START, BONUS_TIME_END.
 REPLAYS_DIR = "C:\\Users\\ulmea\\Desktop\\Probleme\\Trackmania\\test_date_roti\\RawDataset\\ABC\\A-9_keyboard"
 
 

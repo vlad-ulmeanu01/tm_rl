@@ -25,11 +25,11 @@ class DQN(torch.nn.Module):
         self.imsize = (19, 9, 19)
 
         # TODO: more out channels, pooling? revert from utils.VALUES_STEER to utils.VALUES_ACTIONS.
-        self.conv = torch.nn.Conv3d(in_channels = 1, out_channels = 24, kernel_size = (3, 3, 3))
+        self.conv = torch.nn.Conv3d(in_channels = 1, out_channels = 12, kernel_size = (3, 3, 3))
         self.pool = torch.nn.MaxPool3d(kernel_size = (2, 2, 2))
         self.conv_relu = torch.nn.ReLU()
 
-        fc_insize = np.product([(ims - ks_c + 1) // ks_p for ims, ks_c, ks_p in zip(self.imsize, self.conv.kernel_size, self.pool.kernel_size)])
+        fc_insize = np.prod([(ims - ks_c + 1) // ks_p for ims, ks_c, ks_p in zip(self.imsize, self.conv.kernel_size, self.pool.kernel_size)])
 
         self.fc_layers = torch.nn.Sequential(
             torch.nn.Linear(fc_insize, 128),
@@ -71,7 +71,7 @@ class Agent:
 
         self.BATCH_SIZE = 128
         self.LR = 1e-3 # DQN learning rate.
-        self.REPLAY_BUFSIZE = 2 * 10 ** 4
+        self.REPLAY_BUFSIZE = 2 * 10 ** 3
 
         # first active reward:
         self.REWARD1_TOPK_CLOSEST = 3 * self.CNT_REPLAYS
@@ -152,9 +152,10 @@ class Agent:
                     ind_y, ind_z = 0, 0
                     ind_x += 1
 
-        self.replay_buffer = deque([], maxlen = self.REPLAY_BUFSIZE)
+        self.replay_buffers = [deque([], maxlen = self.REPLAY_BUFSIZE) for _ in range(2)] # we use the second replay buffer only for replays finishing in under utils.BONUS_TIME_END.
 
         self.qnet = DQN()
+        # self.qnet.load_state_dict(torch.load(f"{utils.QNET_LOAD_PTS_DIR}net_1736975777_800.pt", weights_only = True))
         self.qnet_criterion = torch.nn.SmoothL1Loss()
         self.qnet_optimizer = torch.optim.Adam(self.qnet.parameters(), lr = self.LR)
 
@@ -194,13 +195,14 @@ class Agent:
     We have ~2s to run as many batch updates as we can on the DQN from the memory buffer.
     """
     def qlearn_update(self):
-        if len(self.replay_buffer) < self.BATCH_SIZE:
+        if len(self.replay_buffers[0]) + len(self.replay_buffers[1]) < self.BATCH_SIZE:
             return
 
         t_start = time.time()
         running_loss, loop_id = 0.0, 0
         while time.time() - t_start < utils.MAX_TIME_INBETWEEN_RUNS:
-            samples = random.sample(self.replay_buffer, self.BATCH_SIZE)
+            samples = random.sample(self.replay_buffers[1], min(len(self.replay_buffers[1]), self.BATCH_SIZE // 2)) # we select at most half good Transitions.
+            samples.extend(random.sample(self.replay_buffers[0], self.BATCH_SIZE - len(samples))) # and the rest as normal Transitions.
 
             state_im_batch = torch.stack([transition.state_im for transition in samples]) # shape: [batch_size, 1, 19, 9, 19].
             next_state_im_batch_nonfinal = torch.stack([transition.next_state_im for transition in samples if transition.next_state_im is not None]) # shape: [<= batch_size, 1, 19, 9, 19].
@@ -251,9 +253,10 @@ class Agent:
             self.rewards[-1] += reward_coef * (utils.MAX_TIME // utils.GAP_TIME - (len(self.states) - 1))
 
         # we pull all self.replay_buffer updates here.
+        bufid = 1 if did_episode_end_normally and (len(self.states) - 1) * utils.GAP_TIME <= utils.BONUS_TIME_END else 0
         for i in range(0, len(self.actions), self.CNT_REPEATING_ACTIONS):
             j = i + self.CNT_REPEATING_ACTIONS
-            self.replay_buffer.append(Transition(self.state_ims[i], self.actions[i], sum(self.rewards[i: j]), self.state_ims[j] if j < len(self.states) else None))
+            self.replay_buffers[bufid].append(Transition(self.state_ims[i], self.actions[i], sum(self.rewards[i: j]), self.state_ims[j] if j < len(self.states) else None))
 
         for dbg_str in [
             f"Episode {self.episode_ind}:",
