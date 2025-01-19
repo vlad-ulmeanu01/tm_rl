@@ -1,13 +1,12 @@
-import matplotlib
-matplotlib.use("Agg")
-
+from collections import deque, namedtuple
 from sklearn.neighbors import KDTree
-import matplotlib.pyplot as plt
-from collections import deque
+from operator import attrgetter
 import pandas as pd
 import numpy as np
 import itertools
 import random
+import typing
+import bisect
 import torch
 import time
 import math
@@ -53,6 +52,48 @@ class Transition:
         self.next_state_im = next_state_im
 
 
+class TopBuffer:
+    # keeps transitions from the top ?? episodes.
+    def __init__(self, max_num_episodes: int):
+        self.EpisodeInfo = namedtuple("EpisodeInfo", "length index")
+        self.max_num_episodes = max_num_episodes
+        self.kept_episode_lengths_indexes = []
+        self.episode_ht = {} # index: episode_transitions.
+        self.curr_index = 0
+
+    def add_episode(self, episode_len: int, episode_transitions: typing.List[Transition]):
+        if len(self.kept_episode_lengths_indexes) >= self.max_num_episodes and self.kept_episode_lengths_indexes[-1].length <= episode_len:
+            return
+
+        if len(self.kept_episode_lengths_indexes) >= self.max_num_episodes:
+            del self.episode_ht[self.kept_episode_lengths_indexes[-1].index]
+            self.kept_episode_lengths_indexes.pop()
+
+        self.episode_ht[self.curr_index] = episode_transitions
+        bisect.insort(self.kept_episode_lengths_indexes, self.EpisodeInfo(episode_len, self.curr_index), key = attrgetter("length"))
+        self.curr_index += 1
+
+    def sample(self, num_samples: int):
+        if num_samples <= 0:
+            return
+
+        total_len = sum([len(self.episode_ht[index]) for index in self.episode_ht])
+        chosen_indexes = list(range(total_len))
+        random.shuffle(chosen_indexes)
+        chosen_indexes = sorted(chosen_indexes[:num_samples], reverse = True)
+
+        transitions = []
+        total_len = 0
+        for index in self.episode_ht:
+            for i, trans in zip(itertools.count(), self.episode_ht[index]):
+                if chosen_indexes and chosen_indexes[-1] - total_len == i:
+                    transitions.append(trans)
+                    chosen_indexes.pop()
+            total_len += len(self.episode_ht[index])
+
+        return transitions
+
+
 class Agent:
     def __init__(self):
         self.states = []  # the states through which we have gone through during the current episode. (raw format from the game)
@@ -72,6 +113,8 @@ class Agent:
         self.BATCH_SIZE = 128
         self.LR = 1e-3 # DQN learning rate.
         self.REPLAY_BUFSIZE = 2 * 10 ** 3
+        self.TOP_BUFFER_CNT_EPISODES = 100
+        self.TOP_BUFFER_SAMPLING_COEF = 0.25 # we are willing to take at most ?? * BATCH_SIZE Transitions out of the buffer containing the top transitions.
 
         # first active reward:
         self.REWARD1_TOPK_CLOSEST = 3 * self.CNT_REPLAYS
@@ -92,10 +135,12 @@ class Agent:
         self.REWARD_END_EPISODE_COEF_START = 10.0 # (time - utils.BONUS_TIME_START) / (utils.BONUS_TIME_END - utils.BONUS_TIME_START) == (end - bonus) / (end - start).
         self.REWARD_END_EPISODE_COEF_END = 30.0
 
-        self.DISCOUNT_FACTOR = 0.995
-        self.EPSILON_SCHEDULER = utils.DecayScheduler(start = 0.9, end = 0.05, decay = 500) # epsilon greedy policy.
+        self.DISCOUNT_FACTOR = 0.99
+        # self.EPSILON_SCHEDULER = utils.DecayScheduler(start = 0.9, end = 0.05, decay = 500) # epsilon greedy policy.
+        self.SOFTMAX_SCHEDULER = utils.DecayScheduler(start = 50, end = 1, decay = 500) # temperature for the softmax policy.
 
-        self.CNT_REPEATING_ACTIONS = 20 # will choose a new action every CNT_REPEATING_ACTIONS.
+        self.CNT_REPEATING_ACTIONS = utils.DecayScheduler(start = 50, end = 10, decay = 500) # will choose a new action every CNT_REPEATING_ACTIONS.
+
         # hyperparameters end.
 
         self.passive_reward_bad_streak = 0
@@ -152,7 +197,8 @@ class Agent:
                     ind_y, ind_z = 0, 0
                     ind_x += 1
 
-        self.replay_buffers = [deque([], maxlen = self.REPLAY_BUFSIZE) for _ in range(2)] # we use the second replay buffer only for replays finishing in under utils.BONUS_TIME_END.
+        self.replay_buffer = deque([], maxlen = self.REPLAY_BUFSIZE) # this is a normal replay buffer.
+        self.top_buffer = TopBuffer(max_num_episodes = self.TOP_BUFFER_CNT_EPISODES) # this buffer remembers the transitions from the top ?? runs.
 
         self.qnet = DQN()
         # self.qnet.load_state_dict(torch.load(f"{utils.QNET_LOAD_PTS_DIR}net_1736975777_800.pt", weights_only = True))
@@ -195,14 +241,14 @@ class Agent:
     We have ~2s to run as many batch updates as we can on the DQN from the memory buffer.
     """
     def qlearn_update(self):
-        if len(self.replay_buffers[0]) + len(self.replay_buffers[1]) < self.BATCH_SIZE:
+        if len(self.replay_buffer) < self.BATCH_SIZE:
             return
 
         t_start = time.time()
         running_loss, loop_id = 0.0, 0
         while time.time() - t_start < utils.MAX_TIME_INBETWEEN_RUNS:
-            samples = random.sample(self.replay_buffers[1], min(len(self.replay_buffers[1]), self.BATCH_SIZE // 2)) # we select at most half good Transitions.
-            samples.extend(random.sample(self.replay_buffers[0], self.BATCH_SIZE - len(samples))) # and the rest as normal Transitions.
+            samples = self.top_buffer.sample(num_samples = int(self.TOP_BUFFER_SAMPLING_COEF * self.BATCH_SIZE)) # selecting from the top Transition buffer.
+            samples.extend(random.sample(self.replay_buffer, self.BATCH_SIZE - len(samples))) # and the rest as normal Transitions.
 
             state_im_batch = torch.stack([transition.state_im for transition in samples]) # shape: [batch_size, 1, 19, 9, 19].
             next_state_im_batch_nonfinal = torch.stack([transition.next_state_im for transition in samples if transition.next_state_im is not None]) # shape: [<= batch_size, 1, 19, 9, 19].
@@ -253,10 +299,14 @@ class Agent:
             self.rewards[-1] += reward_coef * (utils.MAX_TIME // utils.GAP_TIME - (len(self.states) - 1))
 
         # we pull all self.replay_buffer updates here.
-        bufid = 1 if did_episode_end_normally and (len(self.states) - 1) * utils.GAP_TIME <= utils.BONUS_TIME_END else 0
-        for i in range(0, len(self.actions), self.CNT_REPEATING_ACTIONS):
-            j = i + self.CNT_REPEATING_ACTIONS
-            self.replay_buffers[bufid].append(Transition(self.state_ims[i], self.actions[i], sum(self.rewards[i: j]), self.state_ims[j] if j < len(self.states) else None))
+        cnt_repeating_actions = int(self.CNT_REPEATING_ACTIONS.get(self.episode_ind))
+        transitions = []
+        for i in range(0, len(self.actions), cnt_repeating_actions):
+            j = i + cnt_repeating_actions
+            transitions.append(Transition(self.state_ims[i], self.actions[i], sum(self.rewards[i: j]), self.state_ims[j] if j < len(self.states) else None))
+        self.replay_buffer.extend(transitions)
+        if did_episode_end_normally:
+            self.top_buffer.add_episode(episode_len = (len(self.states) - 1) * utils.GAP_TIME, episode_transitions = transitions)
 
         for dbg_str in [
             f"Episode {self.episode_ind}:",
@@ -305,7 +355,7 @@ class Agent:
         state_im = np.zeros((1, *self.qnet.imsize), dtype = np.float32) # 1 = in_channels.
         away_from_replays = False
 
-        if len(self.actions) % self.CNT_REPEATING_ACTIONS == 0: # we actually have to compute the next action, so state_im matters as input for the network.
+        if len(self.actions) % int(self.CNT_REPEATING_ACTIONS.get(self.episode_ind)) == 0: # we actually have to compute the next action, so state_im matters as input for the network.
             new_origin = (state[utils.IND_X], state[utils.IND_Y], state[utils.IND_Z], state[utils.IND_YAW], state[utils.IND_PITCH], state[utils.IND_ROLL])
             indexes = self.replays_kdt.query_radius([new_origin[:3]], r = self.POINTS_RADIUS)[0]
 
@@ -357,21 +407,29 @@ class Agent:
     def next_action(self):
         tstart = time.time()
 
-        if len(self.actions) % self.CNT_REPEATING_ACTIONS:
+        if len(self.actions) % int(self.CNT_REPEATING_ACTIONS.get(self.episode_ind)):
             # just copy the last action.
             self.actions.append(self.actions[-1])
         else:
             best_gas = utils.VAL_GAS
             best_brake = utils.VAL_NO_BRAKE
 
-            if random.random() < self.EPSILON_SCHEDULER.get(self.episode_ind) and self.episode_ind % self.dbg_every:
-                best_steer = random.choice(utils.VALUES_STEER)
-                # best_gas = random.choice(utils.VALUES_GAS)
-                # best_brake = random.choice(utils.VALUES_BRAKE)
-            else:
-                with torch.no_grad(): # we need to unsqueeze for batch_size = 1.
-                    # best_steer, best_gas, best_brake = utils.VALUES_ACTIONS[self.qnet(self.state_ims[-1].unsqueeze(dim = 0))[0].argmax().item()]
-                    best_steer = utils.VALUES_STEER[self.qnet(self.state_ims[-1].unsqueeze(dim = 0))[0].argmax().item()]
+            with torch.no_grad():  # we need to unsqueeze for batch_size = 1.
+                best_steer = utils.VALUES_STEER[
+                    torch.nn.functional.softmax(
+                        self.qnet(self.state_ims[-1].unsqueeze(dim = 0))[0] / self.SOFTMAX_SCHEDULER.get(self.episode_ind),
+                        dim = 0
+                    ).multinomial(num_samples = 1).item()
+                ]
+
+            # if random.random() < self.EPSILON_SCHEDULER.get(self.episode_ind) and self.episode_ind % self.dbg_every:
+            #     best_steer = random.choice(utils.VALUES_STEER)
+            #     # best_gas = random.choice(utils.VALUES_GAS)
+            #     # best_brake = random.choice(utils.VALUES_BRAKE)
+            # else:
+            #     with torch.no_grad(): # we need to unsqueeze for batch_size = 1.
+            #         # best_steer, best_gas, best_brake = utils.VALUES_ACTIONS[self.qnet(self.state_ims[-1].unsqueeze(dim = 0))[0].argmax().item()]
+            #         best_steer = utils.VALUES_STEER[self.qnet(self.state_ims[-1].unsqueeze(dim = 0))[0].argmax().item()]
 
             self.actions.append((best_steer, best_gas, best_brake))
 
