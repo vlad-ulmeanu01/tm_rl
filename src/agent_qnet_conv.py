@@ -1,98 +1,17 @@
-from collections import deque, namedtuple
 from sklearn.neighbors import KDTree
-from operator import attrgetter
+from collections import deque
 import pandas as pd
 import numpy as np
 import itertools
 import random
-import typing
-import bisect
 import torch
 import time
 import math
+import copy
 import os
 
+import qnet_conv_helper
 import utils
-
-
-class DQN(torch.nn.Module):
-    # (for now) the state is represented by the 3D minimap (X = 19, Y = 9, Z = 19) of the surroundings of the car, +Z represents its walking direction.
-    # the network outputs the estimates for Q(s, a) for all 12 possible actions (3 for now, only for STEER).
-    def __init__(self):
-        super(DQN, self).__init__()
-
-        self.imsize = (19, 9, 19)
-
-        # TODO: more out channels, pooling? revert from utils.VALUES_STEER to utils.VALUES_ACTIONS.
-        self.conv = torch.nn.Conv3d(in_channels = 1, out_channels = 12, kernel_size = (3, 3, 3))
-        self.pool = torch.nn.MaxPool3d(kernel_size = (2, 2, 2))
-        self.conv_relu = torch.nn.ReLU()
-
-        fc_insize = np.prod([(ims - ks_c + 1) // ks_p for ims, ks_c, ks_p in zip(self.imsize, self.conv.kernel_size, self.pool.kernel_size)])
-
-        self.fc_layers = torch.nn.Sequential(
-            torch.nn.Linear(fc_insize, 128),
-            torch.nn.ReLU(),
-            torch.nn.Linear(128, len(utils.VALUES_STEER))
-        )
-
-    # state_im should have a shape of [batch_size, in_channels = 1, *self.imsize].
-    def forward(self, state_im: torch.tensor):
-        # conv(x)'s shape is [batch_size, out_channels, ??, ??, ??], channel avg conv <=> mean on dim 1. we view to flatten everything but the batch size.
-        out = self.conv_relu(self.pool(self.conv(state_im)).mean(dim = 1).view(state_im.shape[0], -1))
-        out = self.fc_layers(out)
-        return out
-
-
-class Transition:
-    def __init__(self, state_im: torch.tensor, action: tuple, reward: float, next_state_im: torch.tensor):
-        self.state_im = state_im
-        self.action = action
-        self.reward = reward
-        self.next_state_im = next_state_im
-
-
-class TopBuffer:
-    # keeps transitions from the top ?? episodes.
-    def __init__(self, max_num_episodes: int):
-        self.EpisodeInfo = namedtuple("EpisodeInfo", "length index")
-        self.max_num_episodes = max_num_episodes
-        self.kept_episode_lengths_indexes = []
-        self.episode_ht = {} # index: episode_transitions.
-        self.curr_index = 0
-
-    def add_episode(self, episode_len: int, episode_transitions: typing.List[Transition]):
-        if len(self.kept_episode_lengths_indexes) >= self.max_num_episodes and self.kept_episode_lengths_indexes[-1].length <= episode_len:
-            return
-
-        if len(self.kept_episode_lengths_indexes) >= self.max_num_episodes:
-            del self.episode_ht[self.kept_episode_lengths_indexes[-1].index]
-            self.kept_episode_lengths_indexes.pop()
-
-        self.episode_ht[self.curr_index] = episode_transitions
-        bisect.insort(self.kept_episode_lengths_indexes, self.EpisodeInfo(episode_len, self.curr_index), key = attrgetter("length"))
-        self.curr_index += 1
-
-    def sample(self, num_samples: int):
-        if num_samples <= 0:
-            return
-
-        total_len = sum([len(self.episode_ht[index]) for index in self.episode_ht])
-        chosen_indexes = list(range(total_len))
-        random.shuffle(chosen_indexes)
-        chosen_indexes = sorted(chosen_indexes[:num_samples], reverse = True)
-
-        transitions = []
-        total_len = 0
-        for index in self.episode_ht:
-            for i, trans in zip(itertools.count(), self.episode_ht[index]):
-                if chosen_indexes and chosen_indexes[-1] - total_len == i:
-                    transitions.append(trans)
-                    chosen_indexes.pop()
-            total_len += len(self.episode_ht[index])
-
-        return transitions
-
 
 class Agent:
     def __init__(self):
@@ -136,10 +55,12 @@ class Agent:
         self.REWARD_END_EPISODE_COEF_END = 30.0
 
         self.DISCOUNT_FACTOR = 0.99
+        self.OFFLINE_NET_UPD_COEF = 5e-3 # the offline net tends towards the online net with ?? per episode update.
+
         # self.EPSILON_SCHEDULER = utils.DecayScheduler(start = 0.9, end = 0.05, decay = 500) # epsilon greedy policy.
         self.SOFTMAX_SCHEDULER = utils.DecayScheduler(start = 50, end = 1, decay = 500) # temperature for the softmax policy.
 
-        self.CNT_REPEATING_ACTIONS = utils.DecayScheduler(start = 50, end = 10, decay = 500) # will choose a new action every CNT_REPEATING_ACTIONS.
+        self.CNT_REPEATING_ACTIONS = utils.DecayScheduler(start = 50, end = 10, decay = 1000) # will choose a new action every CNT_REPEATING_ACTIONS.
 
         # hyperparameters end.
 
@@ -198,10 +119,13 @@ class Agent:
                     ind_x += 1
 
         self.replay_buffer = deque([], maxlen = self.REPLAY_BUFSIZE) # this is a normal replay buffer.
-        self.top_buffer = TopBuffer(max_num_episodes = self.TOP_BUFFER_CNT_EPISODES) # this buffer remembers the transitions from the top ?? runs.
+        self.top_buffer = qnet_conv_helper.TopBuffer(max_num_episodes = self.TOP_BUFFER_CNT_EPISODES) # this buffer remembers the transitions from the top ?? runs.
 
-        self.qnet = DQN()
+        self.qnet = qnet_conv_helper.DQN2(num_state_ims = 2)
         # self.qnet.load_state_dict(torch.load(f"{utils.QNET_LOAD_PTS_DIR}net_1736975777_800.pt", weights_only = True))
+
+        self.qnet_offline = copy.deepcopy(self.qnet)
+
         self.qnet_criterion = torch.nn.SmoothL1Loss()
         self.qnet_optimizer = torch.optim.Adam(self.qnet.parameters(), lr = self.LR)
 
@@ -250,12 +174,17 @@ class Agent:
             samples = self.top_buffer.sample(num_samples = int(self.TOP_BUFFER_SAMPLING_COEF * self.BATCH_SIZE)) # selecting from the top Transition buffer.
             samples.extend(random.sample(self.replay_buffer, self.BATCH_SIZE - len(samples))) # and the rest as normal Transitions.
 
-            state_im_batch = torch.stack([transition.state_im for transition in samples]) # shape: [batch_size, 1, 19, 9, 19].
-            next_state_im_batch_nonfinal = torch.stack([transition.next_state_im for transition in samples if transition.next_state_im is not None]) # shape: [<= batch_size, 1, 19, 9, 19].
+            state_im_batch = torch.stack([transition.state_im for transition in samples]) # shape: [batch_size, num_channels = 2, 19, 9, 19].
+
+            next_state_im_batch_nonfinal = torch.stack([
+                torch.cat([transition.state_im[-1].unsqueeze(dim = 0), transition.next_state_im]) # the resulting state_im: last from start + next. need to unsqueeze to keep the channel dim.
+                for transition in samples if transition.next_state_im is not None
+            ]) # shape: [<= batch_size, num_channels = 2, 19, 9, 19].
+
             state_action_values = self.qnet(state_im_batch) # shape: [batch_size, 12] (for now: [batch_size, 3]).
 
             with torch.no_grad():
-                next_state_action_values_nonfinal = self.qnet(next_state_im_batch_nonfinal).max(dim = 1).values
+                next_state_action_values_nonfinal = self.qnet_offline(next_state_im_batch_nonfinal).max(dim = 1).values
                 expected_state_action_values = torch.clone(state_action_values).detach()
 
                 nonfinal_id = 0
@@ -278,10 +207,15 @@ class Agent:
             torch.nn.utils.clip_grad_value_(self.qnet.parameters(), 100)
             self.qnet_optimizer.step()
 
+            online_dict, offline_dict = self.qnet.state_dict(), self.qnet_offline.state_dict()
+            for key in online_dict:
+                offline_dict[key] = offline_dict[key] * (1 - self.OFFLINE_NET_UPD_COEF) + online_dict[key] * self.OFFLINE_NET_UPD_COEF
+            self.qnet_offline.load_state_dict(offline_dict)
+
             loop_id += 1
 
         running_loss /= (self.BATCH_SIZE * loop_id)
-        print(f"finished {loop_id} batches, avg loss per action output = {round(running_loss, 7)}.")
+        print(f"finished {loop_id} batches, avg loss per action output = {round(running_loss, 5)}.")
 
 
     """
@@ -303,7 +237,15 @@ class Agent:
         transitions = []
         for i in range(0, len(self.actions), cnt_repeating_actions):
             j = i + cnt_repeating_actions
-            transitions.append(Transition(self.state_ims[i], self.actions[i], sum(self.rewards[i: j]), self.state_ims[j] if j < len(self.states) else None))
+            z = max(0, i - cnt_repeating_actions)
+
+            transitions.append(qnet_conv_helper.Transition(
+                torch.cat([self.state_ims[z], self.state_ims[i]]), # append two consecutive frames as input <=> input state_im shape is [num_channels = 2, ??, ??, ??].
+                self.actions[i],
+                sum(self.rewards[i: j]),
+                self.state_ims[j] if j < len(self.states) else None
+            ))
+
         self.replay_buffer.extend(transitions)
         if did_episode_end_normally:
             self.top_buffer.add_episode(episode_len = (len(self.states) - 1) * utils.GAP_TIME, episode_transitions = transitions)
@@ -417,7 +359,8 @@ class Agent:
             with torch.no_grad():  # we need to unsqueeze for batch_size = 1.
                 best_steer = utils.VALUES_STEER[
                     torch.nn.functional.softmax(
-                        self.qnet(self.state_ims[-1].unsqueeze(dim = 0))[0] / self.SOFTMAX_SCHEDULER.get(self.episode_ind),
+                        self.qnet(torch.cat([self.state_ims[-2 if len(self.state_ims) >= 2 else -1], self.state_ims[-1]]).unsqueeze(dim = 0))[0] /
+                            self.SOFTMAX_SCHEDULER.get(self.episode_ind),
                         dim = 0
                     ).multinomial(num_samples = 1).item()
                 ]
