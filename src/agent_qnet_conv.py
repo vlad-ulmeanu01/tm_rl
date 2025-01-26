@@ -1,5 +1,4 @@
 from sklearn.neighbors import KDTree
-from collections import deque
 import pandas as pd
 import numpy as np
 import itertools
@@ -31,9 +30,8 @@ class Agent:
 
         self.BATCH_SIZE = 128
         self.LR = 1e-3 # DQN learning rate.
-        self.REPLAY_BUFSIZE = 2 * 10 ** 3
-        self.TOP_BUFFER_CNT_EPISODES = 100
-        self.TOP_BUFFER_SAMPLING_COEF = 0.25 # we are willing to take at most ?? * BATCH_SIZE Transitions out of the buffer containing the top transitions.
+        self.REPLAY_BUFSIZE = 3 * 10 ** 3
+        self.PRIO_BUFF_ALPHA, self.PRIO_BUFF_BETA, self.PRIO_BUFF_EPS = 0.7, 0.5, 1e-7
 
         # first active reward:
         self.REWARD1_TOPK_CLOSEST = 3 * self.CNT_REPLAYS
@@ -118,8 +116,8 @@ class Agent:
                     ind_y, ind_z = 0, 0
                     ind_x += 1
 
-        self.replay_buffer = deque([], maxlen = self.REPLAY_BUFSIZE) # this is a normal replay buffer.
-        self.top_buffer = qnet_conv_helper.TopBuffer(max_num_episodes = self.TOP_BUFFER_CNT_EPISODES) # this buffer remembers the transitions from the top ?? runs.
+        self.priority_replay_buffer = qnet_conv_helper.WeightedDeque(maxlen = self.REPLAY_BUFSIZE) # we only use a prioritised replay buffer.
+        self.max_abs_td = 0.0 # the maximum temporal difference in absolute value, encountered in an update loop.
 
         self.qnet = qnet_conv_helper.DQN2(num_state_ims = 2)
         # self.qnet.load_state_dict(torch.load(f"{utils.QNET_LOAD_PTS_DIR}net_1736975777_800.pt", weights_only = True))
@@ -127,14 +125,13 @@ class Agent:
         self.qnet_offline = copy.deepcopy(self.qnet)
 
         self.qnet_criterion = torch.nn.SmoothL1Loss()
+        self.qnet_criterion_nored = torch.nn.SmoothL1Loss(reduction = 'none')
         self.qnet_optimizer = torch.optim.Adam(self.qnet.parameters(), lr = self.LR)
 
         self.dbg_tstart = time.time()
         self.dbg_reward_log = open(f"{utils.LOG_OUTPUT_DIR_PREFIX}qnet_conv_{int(self.dbg_tstart)}_rewards.txt", "w")
         self.dbg_log = open(f"{utils.LOG_OUTPUT_DIR_PREFIX}qnet_conv_{int(self.dbg_tstart)}.txt", "w")
         self.dbg_ht = {"receive_new_state": 0.0, "next_action": 0.0, "sum_reward_passive": 0.0, "sum_reward_active1": 0.0, "sum_reward_active2": 0.0}
-
-        # self.dbg_fig, self.dbg_ax = plt.subplots(2, 2, figsize = (10, 5))
 
         print(f"agent_qnet_conv loaded.")
 
@@ -165,14 +162,14 @@ class Agent:
     We have ~2s to run as many batch updates as we can on the DQN from the memory buffer.
     """
     def qlearn_update(self):
-        if len(self.replay_buffer) < self.BATCH_SIZE:
+        if len(self.priority_replay_buffer) < self.BATCH_SIZE:
             return
 
         t_start = time.time()
         running_loss, loop_id = 0.0, 0
         while time.time() - t_start < utils.MAX_TIME_INBETWEEN_RUNS:
-            samples = self.top_buffer.sample(num_samples = int(self.TOP_BUFFER_SAMPLING_COEF * self.BATCH_SIZE)) # selecting from the top Transition buffer.
-            samples.extend(random.sample(self.replay_buffer, self.BATCH_SIZE - len(samples))) # and the rest as normal Transitions.
+            sample_indexes = self.priority_replay_buffer.sample(self.BATCH_SIZE)
+            samples = [self.priority_replay_buffer.dq_items[index] for index in sample_indexes]
 
             state_im_batch = torch.stack([transition.state_im for transition in samples]) # shape: [batch_size, num_channels = 2, 19, 9, 19].
 
@@ -183,6 +180,7 @@ class Agent:
 
             state_action_values = self.qnet(state_im_batch) # shape: [batch_size, 12] (for now: [batch_size, 3]).
 
+            priority_weights = np.zeros(self.BATCH_SIZE)  # we should give lower importance to samples that are likely to be prioritised from the buffer.
             with torch.no_grad():
                 next_state_action_values_nonfinal = self.qnet_offline(next_state_im_batch_nonfinal).max(dim = 1).values
                 expected_state_action_values = torch.clone(state_action_values).detach()
@@ -196,10 +194,29 @@ class Agent:
                     if samples[batch_id].next_state_im is None:
                         expected_state_action_values[batch_id, action_id] = 0
                     else:
+                        abs_td = expected_state_action_values[batch_id, action_id].item() # remember the network's estimate of the SA value.
+
                         expected_state_action_values[batch_id, action_id] = samples[batch_id].reward + self.DISCOUNT_FACTOR * next_state_action_values_nonfinal[nonfinal_id]
                         nonfinal_id += 1
 
-            loss = self.qnet_criterion(state_action_values, expected_state_action_values)
+                        # compute the absolute temporal difference and update the deque weight.
+                        abs_td = abs(expected_state_action_values[batch_id, action_id].item() - abs_td)
+                        new_weight = (abs_td + self.PRIO_BUFF_EPS) ** self.PRIO_BUFF_ALPHA
+
+                        self.max_abs_td = max(self.max_abs_td, abs_td)
+                        self.priority_replay_buffer.update_weight(
+                            index = sample_indexes[batch_id],
+                            new_weight = new_weight
+                        )
+
+                        # divide by the sum of all buffer priorities. we use this to compute the probability of an item being chosen.
+                        proba = (abs_td + self.PRIO_BUFF_EPS) / self.priority_replay_buffer._aib_prefsum(self.priority_replay_buffer.maxlen - 1)
+                        priority_weights[batch_id] = 1.0 / (len(self.priority_replay_buffer) * proba) ** self.PRIO_BUFF_BETA
+
+                priority_weights /= priority_weights.sum()
+
+            # loss = self.qnet_criterion(state_action_values, expected_state_action_values)
+            loss = (self.qnet_criterion_nored(state_action_values, expected_state_action_values) * torch.tensor(priority_weights).view(-1, 1)).mean()
             running_loss += loss.item()
 
             self.qnet_optimizer.zero_grad()
@@ -214,7 +231,7 @@ class Agent:
 
             loop_id += 1
 
-        running_loss /= (self.BATCH_SIZE * loop_id)
+        running_loss /= loop_id
         print(f"finished {loop_id} batches, avg loss per action output = {round(running_loss, 5)}.")
 
 
@@ -234,21 +251,19 @@ class Agent:
 
         # we pull all self.replay_buffer updates here.
         cnt_repeating_actions = int(self.CNT_REPEATING_ACTIONS.get(self.episode_ind))
-        transitions = []
         for i in range(0, len(self.actions), cnt_repeating_actions):
             j = i + cnt_repeating_actions
             z = max(0, i - cnt_repeating_actions)
 
-            transitions.append(qnet_conv_helper.Transition(
-                torch.cat([self.state_ims[z], self.state_ims[i]]), # append two consecutive frames as input <=> input state_im shape is [num_channels = 2, ??, ??, ??].
-                self.actions[i],
-                sum(self.rewards[i: j]),
-                self.state_ims[j] if j < len(self.states) else None
-            ))
-
-        self.replay_buffer.extend(transitions)
-        if did_episode_end_normally:
-            self.top_buffer.add_episode(episode_len = (len(self.states) - 1) * utils.GAP_TIME, episode_transitions = transitions)
+            self.priority_replay_buffer.append(
+                item = qnet_conv_helper.Transition(
+                    torch.cat([self.state_ims[z], self.state_ims[i]]), # append two consecutive frames as input <=> input state_im shape is [num_channels = 2, ??, ??, ??].
+                    self.actions[i],
+                    sum(self.rewards[i: j]),
+                    self.state_ims[j] if j < len(self.states) else None
+                ),
+                weight = (self.max_abs_td + self.PRIO_BUFF_EPS) ** self.PRIO_BUFF_ALPHA # we insert the transition with the highest known temporal diff s.t. we have a good chance of actually updating its weight.
+            )
 
         for dbg_str in [
             f"Episode {self.episode_ind}:",

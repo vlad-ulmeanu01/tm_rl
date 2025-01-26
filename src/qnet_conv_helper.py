@@ -1,4 +1,4 @@
-from collections import namedtuple
+from collections import deque, namedtuple
 from operator import attrgetter
 import numpy as np
 import itertools
@@ -125,3 +125,66 @@ class TopBuffer:
             total_len += len(self.episode_ht[index])
 
         return transitions
+
+
+class WeightedDeque:
+    # this circular deque remembers pairs of (item, weight sum).
+    # if a pair's weight is w, and the total weight of the items in the deque is sw, then that item is sampled (with replacement) with proba w / sw.
+    # this class supports weight updates.
+    def __init__(self, maxlen: int):
+        self.maxlen = maxlen
+        self.dq_items = [None for _ in range(self.maxlen)]
+        self.dq_aib_weights = [0.0 for _ in range(self.maxlen)]  # this is the Binary Indexed Tree version of the weights array.
+        self.tail = 0  # the position at which to add a new element.
+        self.len = 0
+        self.maxpas = 1
+        while self.maxpas < self.maxlen:
+            self.maxpas *= 2
+
+    def __len__(self):
+        return self.len
+
+    def _lsb(self, x: int):
+        return x & (-x)
+
+    def _aib_prefsum(self, index: int):
+        ans, i = 0, index + 1
+        while i > 0:
+            ans += self.dq_aib_weights[i - 1]
+            i -= self._lsb(i)
+        return ans
+
+    def update_weight(self, index: int, new_weight: float):
+        diff_weight, i = new_weight - (self._aib_prefsum(index) - self._aib_prefsum(index - 1)), index + 1 # compute the difference between the new and old weight.
+        while i <= self.maxlen:
+            self.dq_aib_weights[i - 1] += diff_weight
+            i += self._lsb(i)
+
+    def append(self, item, weight: float):
+        self.dq_items[self.tail] = item
+        self.update_weight(self.tail, weight)
+        self.tail = (self.tail + 1) % self.maxlen
+        self.len = min(self.maxlen, self.len + 1)
+
+    def extend(self, items_weights: list):
+        for item, weight in items_weights:
+            self.append(item, weight)
+
+    # returns the self.dq_items indexes of the chosen objects.
+    def sample(self, batch_size: int):
+        if self.len == 0:
+            return []
+
+        indexes = []
+        for _ in range(batch_size):
+            r = random.random() * self._aib_prefsum(self.maxlen - 1)
+
+            # we search for the rightmost index for which prefsum(index - 1) <= r.
+            index, pas = 0, self.maxpas
+            while pas:
+                if index + pas < self.maxlen and self._aib_prefsum(index + pas - 1) <= r:
+                    index += pas
+                pas >>= 1
+            indexes.append(index)
+
+        return indexes
