@@ -62,10 +62,13 @@ def read_processed_input(fname: str):
 """
 Writes processed actions in a file such that they may be read by TMInterface.
 The actions tuple is made out of three lists of equal size: steer, gas and brake actions.
+If outstream is not None, we will write some log information to stdout / the outstream.
 """
-def write_processed_output(fname: str, actions: typing.List[typing.Tuple], mention_write: bool):
-    if mention_write:
-        print(f"(write_processed_output) Will write to {fname = }.")
+def write_processed_output(fname: str, actions: typing.List[typing.Tuple], outstream):
+    if outstream is not None:
+        dbg_str = f"(write_processed_output) Will write to {fname = }."
+        outstream.write(dbg_str + "\n"); outstream.flush()
+        print(dbg_str)
 
     with open(fname, "w") as fout:
         steer, gas, brake = [s for s, g, b in actions], [g for s, g, b in actions], [b for s, g, b in actions]

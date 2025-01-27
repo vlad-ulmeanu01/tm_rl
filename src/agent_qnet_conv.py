@@ -58,7 +58,7 @@ class Agent:
         # self.EPSILON_SCHEDULER = utils.DecayScheduler(start = 0.9, end = 0.05, decay = 500) # epsilon greedy policy.
         self.SOFTMAX_SCHEDULER = utils.DecayScheduler(start = 50, end = 1, decay = 500) # temperature for the softmax policy.
 
-        self.CNT_REPEATING_ACTIONS = utils.DecayScheduler(start = 50, end = 10, decay = 1000) # will choose a new action every CNT_REPEATING_ACTIONS.
+        self.CNT_REPEATING_ACTIONS = utils.DecayScheduler(start = 50, end = 15, decay = 1000) # will choose a new action every CNT_REPEATING_ACTIONS.
 
         # hyperparameters end.
 
@@ -120,7 +120,7 @@ class Agent:
         self.max_abs_td = 0.0 # the maximum temporal difference in absolute value, encountered in an update loop.
 
         self.qnet = qnet_conv_helper.DQN2(num_state_ims = 2)
-        # self.qnet.load_state_dict(torch.load(f"{utils.QNET_LOAD_PTS_DIR}net_1736975777_800.pt", weights_only = True))
+        # self.qnet.load_state_dict(torch.load(f"{utils.QNET_LOAD_PTS_DIR}net_1737843159_4000.pt", weights_only = True))
 
         self.qnet_offline = copy.deepcopy(self.qnet)
 
@@ -182,9 +182,15 @@ class Agent:
 
             priority_weights = np.zeros(self.BATCH_SIZE)  # we should give lower importance to samples that are likely to be prioritised from the buffer.
             with torch.no_grad():
-                next_state_action_values_nonfinal = self.qnet_offline(next_state_im_batch_nonfinal).max(dim = 1).values
-                expected_state_action_values = torch.clone(state_action_values).detach()
+                # DQN:
+                # next_state_action_values_nonfinal = self.qnet_offline(next_state_im_batch_nonfinal).max(dim = 1).values
 
+                # DDQN: the action a that provides the best Q_off(s[t+1], a) may be overestimated. instead, we take a' that provides the best Q_on(s[t+1], a'),
+                # then compute the offline net's estimation of it: Q_off(s[t+1], a').
+                online_qnet_argmax_nonfinal_indexes = self.qnet(next_state_im_batch_nonfinal).argmax(dim = 1)
+                offline_qnet_nonfinal = self.qnet_offline(next_state_im_batch_nonfinal)
+
+                expected_state_action_values = torch.clone(state_action_values).detach()
                 nonfinal_id = 0
                 for batch_id in range(self.BATCH_SIZE):
                     # action_id = utils.ACTION_INDEX_HT[samples[batch_id].action]
@@ -196,7 +202,10 @@ class Agent:
                     else:
                         abs_td = expected_state_action_values[batch_id, action_id].item() # remember the network's estimate of the SA value.
 
-                        expected_state_action_values[batch_id, action_id] = samples[batch_id].reward + self.DISCOUNT_FACTOR * next_state_action_values_nonfinal[nonfinal_id]
+                        expected_state_action_values[batch_id, action_id] = samples[batch_id].reward + self.DISCOUNT_FACTOR * offline_qnet_nonfinal[
+                            nonfinal_id,
+                            online_qnet_argmax_nonfinal_indexes[nonfinal_id].item() # DDQN: we use the offline estimation for the best action indicated by the online net.
+                        ]
                         nonfinal_id += 1
 
                         # compute the absolute temporal difference and update the deque weight.
@@ -232,7 +241,10 @@ class Agent:
             loop_id += 1
 
         running_loss /= loop_id
-        print(f"finished {loop_id} batches, avg loss per action output = {round(running_loss, 5)}.")
+        
+        dbg_str = f"finished {loop_id} batches, avg loss per action output = {round(running_loss, 5)}."
+        self.dbg_log.write(dbg_str + "\n"); self.dbg_log.flush()
+        print(dbg_str)
 
 
     """
@@ -259,7 +271,7 @@ class Agent:
                 item = qnet_conv_helper.Transition(
                     torch.cat([self.state_ims[z], self.state_ims[i]]), # append two consecutive frames as input <=> input state_im shape is [num_channels = 2, ??, ??, ??].
                     self.actions[i],
-                    sum(self.rewards[i: j]),
+                    sum(self.rewards[i: j]), # qnet_conv_helper.decayed_sum(self.rewards[i: j], self.DISCOUNT_FACTOR)
                     self.state_ims[j] if j < len(self.states) else None
                 ),
                 weight = (self.max_abs_td + self.PRIO_BUFF_EPS) ** self.PRIO_BUFF_ALPHA # we insert the transition with the highest known temporal diff s.t. we have a good chance of actually updating its weight.
@@ -271,9 +283,8 @@ class Agent:
             f"Rewards: passive: {round(self.dbg_ht['sum_reward_passive'], 3)}, active 1: {round(self.dbg_ht['sum_reward_active1'], 3)}, active 2: {round(self.dbg_ht['sum_reward_active2'], 3)}",
             f"Time from start: {round(time.time() - self.dbg_tstart, 3)}, this episode in receive_new_state: {round(self.dbg_ht['receive_new_state'], 3)}, next_action: {round(self.dbg_ht['next_action'], 3)}"
         ]:
+            self.dbg_log.write(dbg_str + "\n"); self.dbg_log.flush()
             print(dbg_str)
-            self.dbg_log.write(dbg_str + "\n")
-            self.dbg_log.flush()
 
         self.dbg_reward_log.write(' '.join(map(str, np.round(self.rewards, 3))) + "\n")
         self.dbg_reward_log.flush()
@@ -283,7 +294,7 @@ class Agent:
         utils.write_processed_output(
             fname = f"{utils.PARTIAL_OUTPUT_DIR_PREFIX}{int(self.dbg_tstart)}_{self.episode_ind}_{(len(self.states) - 1) * utils.GAP_TIME}.txt",
             actions = self.actions,
-            mention_write = False
+            outstream = None # we don't log partial runs.
         )
         if self.episode_ind % self.dbg_every == 0:
             torch.save(self.qnet.state_dict(), f"{utils.QNET_OUTPUT_DIR_PREFIX}net_{int(self.dbg_tstart)}_{self.episode_ind}.pt")
@@ -292,7 +303,7 @@ class Agent:
             utils.write_processed_output(
                 fname = f"{utils.PROCESSED_OUTPUT_DIR_PREFIX}{int(self.dbg_tstart)}_{self.episode_ind}_{(len(self.states) - 1) * utils.GAP_TIME}.txt",
                 actions = self.actions,
-                mention_write = True
+                outstream = self.dbg_log
             )
 
         self.clear_episode()
@@ -372,13 +383,16 @@ class Agent:
             best_brake = utils.VAL_NO_BRAKE
 
             with torch.no_grad():  # we need to unsqueeze for batch_size = 1.
-                best_steer = utils.VALUES_STEER[
-                    torch.nn.functional.softmax(
-                        self.qnet(torch.cat([self.state_ims[-2 if len(self.state_ims) >= 2 else -1], self.state_ims[-1]]).unsqueeze(dim = 0))[0] /
-                            self.SOFTMAX_SCHEDULER.get(self.episode_ind),
-                        dim = 0
-                    ).multinomial(num_samples = 1).item()
-                ]
+                qnet_out = self.qnet(torch.cat([self.state_ims[-2 if len(self.state_ims) >= 2 else -1], self.state_ims[-1]]).unsqueeze(dim = 0))[0]
+
+                if self.episode_ind % self.dbg_every:
+                    best_steer = utils.VALUES_STEER[
+                        torch.nn.functional.softmax(
+                            qnet_out / self.SOFTMAX_SCHEDULER.get(self.episode_ind), dim = 0
+                        ).multinomial(num_samples = 1).item()
+                    ]
+                else: # do an argmax run every self.dbg_every episodes.
+                    best_steer = utils.VALUES_STEER[qnet_out.argmax().item()]
 
             # if random.random() < self.EPSILON_SCHEDULER.get(self.episode_ind) and self.episode_ind % self.dbg_every:
             #     best_steer = random.choice(utils.VALUES_STEER)

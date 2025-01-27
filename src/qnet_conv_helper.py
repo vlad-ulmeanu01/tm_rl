@@ -9,6 +9,14 @@ import torch
 
 import utils
 
+
+def decayed_sum(rewards, decay):
+    ans = 0.0
+    for reward in rewards[::-1]:
+        ans = ans * decay + reward
+    return ans
+
+
 class DQN(torch.nn.Module):
     # (for now) the state is represented by the 3D minimap (X = 19, Y = 9, Z = 19) of the surroundings of the car, +Z represents its walking direction.
     # the network outputs the estimates for Q(s, a) for all 12 possible actions (3 for now, only for STEER).
