@@ -120,7 +120,7 @@ class Agent:
         self.max_abs_td = 0.0 # the maximum temporal difference in absolute value, encountered in an update loop.
 
         self.qnet = qnet_conv_helper.DQN2(num_state_ims = 2)
-        # self.qnet.load_state_dict(torch.load(f"{utils.QNET_LOAD_PTS_DIR}net_1737843159_4000.pt", weights_only = True))
+        self.qnet.load_state_dict(torch.load(f"{utils.QNET_LOAD_PTS_DIR}net_1737843159_4000.pt", weights_only = True))
 
         self.qnet_offline = copy.deepcopy(self.qnet)
 
@@ -245,6 +245,13 @@ class Agent:
         dbg_str = f"finished {loop_id} batches, avg loss per action output = {round(running_loss, 5)}."
         self.dbg_log.write(dbg_str + "\n"); self.dbg_log.flush()
         print(dbg_str)
+
+
+    """
+    Called by the client to let us know that we passed a checkpoint.
+    """
+    def passed_checkpoint(self):
+        self.rewards[-1] += utils.REWARD_COEF_PER_CHECKPOINT * (utils.MAX_TIME // utils.GAP_TIME - (len(self.states) - 1))
 
 
     """

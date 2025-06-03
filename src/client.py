@@ -8,7 +8,8 @@ import copy
 import time
 import sys
 
-import agent_qnet_conv
+# import agent_qnet_conv
+import agent_q_fixed_points
 import utils
 
 
@@ -16,7 +17,7 @@ class MainClient(Client):
     def __init__(self):
         super().__init__()
 
-        self.agent = agent_qnet_conv.Agent()
+        self.agent = agent_q_fixed_points.Agent()
         self.remembered_state = None
 
     def on_registered(self, iface: TMInterface):
@@ -70,6 +71,8 @@ class MainClient(Client):
 
     def on_checkpoint_count_changed(self, iface: TMInterface, current: int, target: int):
         if current < target:
+            if current > 0:
+                self.agent.passed_checkpoint()
             return
 
         iface.prevent_simulation_finish()

@@ -6,11 +6,14 @@ import math
 
 GAP_TIME = 10 # ms, length of one timestep.
 PROCESSED_OUTPUT_DIR_PREFIX = "../processed_outputs/output_"
-PARTIAL_OUTPUT_DIR_PREFIX = "../qnet_conv_outputs/partial_"
+# PARTIAL_OUTPUT_DIR_PREFIX = "../qnet_conv_outputs/partial_"
+PARTIAL_OUTPUT_DIR_PREFIX = "../q_fixed_outputs/partial_"
 LOG_OUTPUT_DIR_PREFIX = "../logs/"
 FIGURES_OUTPUT_DIR_PREFIX = "../figures/"
-QNET_OUTPUT_DIR_PREFIX = "../qnet_conv_outputs/"
-QNET_LOAD_PTS_DIR = "../qnet_conv_saved_pts/"
+# QNET_OUTPUT_DIR_PREFIX = "../qnet_conv_outputs/"
+QNET_OUTPUT_DIR_PREFIX = "../q_fixed_outputs/"
+# QNET_LOAD_PTS_DIR = "../qnet_conv_saved_pts/"
+QNET_LOAD_PTS_DIR = "../q_fixed_saved_pts/"
 
 IND_STEER, IND_GAS, IND_BRAKE = 0, 1, 2
 
@@ -23,18 +26,47 @@ VALUES_GAS = [VAL_NO_GAS, VAL_GAS]
 VAL_NO_BRAKE, VAL_BRAKE = 0, 1
 VALUES_BRAKE = [VAL_NO_BRAKE, VAL_BRAKE]
 
-VALUES_ACTIONS = list(itertools.product(VALUES_STEER, VALUES_GAS, VALUES_BRAKE))
+SUBACTIONS_NAMES = ["steer", "gas", "brake"]
+SUBACTIONS_VALUES = {"steer": VALUES_STEER, "gas": VALUES_GAS, "brake": VALUES_BRAKE}
+
+# VALUES_ACTIONS = list(itertools.product(VALUES_STEER, VALUES_GAS, VALUES_BRAKE))
+VALUES_ACTIONS = [
+    (VAL_STEER_LEFT, VAL_GAS, VAL_NO_BRAKE), (VAL_NO_STEER, VAL_GAS, VAL_NO_BRAKE), (VAL_STEER_RIGHT, VAL_GAS, VAL_NO_BRAKE),
+    (VAL_STEER_LEFT, VAL_NO_GAS, VAL_BRAKE), (VAL_NO_STEER, VAL_NO_GAS, VAL_BRAKE), (VAL_STEER_RIGHT, VAL_NO_GAS, VAL_BRAKE)
+]
 ACTION_INDEX_HT = {action: i for i, action in zip(itertools.count(), VALUES_ACTIONS)}
 
 IND_X, IND_Y, IND_Z, IND_YAW, IND_PITCH, IND_ROLL, IND_VX, IND_VY, IND_VZ, IND_WHEEL_MATERIALS, IND_WHEEL_CONTACT = range(11)
 
-MAX_TIME_INBETWEEN_RUNS = 1.65 # maximum number of seconds that we can do computing between ending an episode and beginning another.
+MAX_TIME_INBETWEEN_RUNS = 1.5 # maximum number of seconds that we can do computing between ending an episode and beginning another.
 
-MAX_TIME = 15_000  # maximum number of milliseconds we're willing to run a replay for.
-BONUS_TIME_START = 6_500 # time around what we would want to hit.
-BONUS_TIME_END = 9_000 # we award a reward bonus for tracks finishing between BONUS_TIME_START, BONUS_TIME_END.
+"""
+MAX_TIME: maximum number of milliseconds we're willing to run a replay for.
+BONUS_TIME_START: time around what we would want to hit.
+BONUS_TIME_END: we award a reward bonus for tracks finishing between BONUS_TIME_START, BONUS_TIME_END.
+REWARD_COEF_PER_CHECKPOINT: award ?? * (how much extra reward we would have gotten for finishing the track then, with no extra coefficient).
+"""
+
+# A-9:
+MAX_TIME = 15_000
+BONUS_TIME_START = 6_500
+BONUS_TIME_END = 9_000
+REWARD_COEF_PER_CHECKPOINT = 1.0
 REPLAYS_DIR = "C:\\Users\\ulmea\\Desktop\\Probleme\\Trackmania\\test_date_roti\\RawDataset\\ABC\\A-9_keyboard"
 
+# TAS-Train:
+# MAX_TIME = 20_000
+# BONUS_TIME_START = 9_000
+# BONUS_TIME_END = 12_000
+# REWARD_COEF_PER_CHECKPOINT = 1.0
+# REPLAYS_DIR = "C:\\Users\\ulmea\\Desktop\\Probleme\\Trackmania\\test_date_roti\\RawDataset\\Others\\TAS-Train1"
+
+# A03-Race:
+# MAX_TIME = 27_500
+# BONUS_TIME_START = 18_000
+# BONUS_TIME_END = 23_000
+# REWARD_COEF_PER_CHECKPOINT = 1.0
+# REPLAYS_DIR = "C:\\Users\\ulmea\\Desktop\\Probleme\\Trackmania\\test_date_roti\\RawDataset\\Others\\A03-Race"
 
 class DecayScheduler:
     def __init__(self, start: float, end: float, decay: float):
