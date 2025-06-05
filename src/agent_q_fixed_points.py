@@ -26,22 +26,34 @@ class Agent:
 
         # hyperparameters:
         self.CNT_REPLAYS = len([entry for entry in os.scandir(utils.REPLAYS_DIR) if entry.is_file()])
+        self.REPLAY_POINTS_ONE_EVERY = 5 # folosim un punct din ?? consecutive in database-ul de puncte din replay-uri.
 
         self.BATCH_SIZE = 128
         self.Q_LR = 1e-2
         self.LR = 3e-3
-        self.REPLAY_BUFSIZE = 10 ** 4
+        self.REPLAY_BUFSIZE = 3 * 10 ** 3
 
-        self.POINTS_RADIUS = 40 # when computing q approximations, only use the points that are at most ?? afar.
-        self.DISCOUNT_FACTOR = 0.999
+        self.DISCOUNT_FACTOR = 0.99
 
-        self.SOFTMAX_SCHEDULER = utils.DecayScheduler(start=2, end=0.5, decay=500) # temperature for the softmax policy. (10, 1, 500)
+        self.SOFTMAX_SCHEDULER = utils.DecayScheduler(start=10, end=0.5, decay=500) # temperature for the softmax policy. (10, 1, 500)
         self.CNT_REPEATING_ACTIONS = utils.DecayScheduler(start=50, end=15, decay=500)  # will choose a new action every CNT_REPEATING_ACTIONS.
 
         self.REWARD_END_EPISODE_COEF_START = 10.0
         self.REWARD_END_EPISODE_COEF_END = 30.0
 
+        self.PASSIVE_REWARD_MAX_BAD_STREAK = 100
+        self.PASSIVE_REWARD_BAD_STREAK_BOUND = 1e-2  # if the car moves less than ?? per frame for 100 consecutive frames, cancel the episode.
+
+        # second active reward:
+        self.REWARD2_RADIUS = 1  # only attempt to reward replay points that are this close to the current position.
+        self.REWARD2_COEF = 0.1
+        self.REWARD2_MAX_EXPONENT = 1
+        self.REWARD2_MIN_FRAME = 100
+        self.REWARD2_YPR_RADIAN_DIFF = math.pi / 24  # will only count a point if the orientation is at most ?? degrees away in any axis.
+
         # hyperparameters end.
+
+        self.passive_reward_bad_streak = 0
 
         self.priority_replay_buffer = qnet_conv_helper.WeightedDeque(maxlen = self.REPLAY_BUFSIZE)  # we only use a prioritised replay buffer.
 
@@ -53,18 +65,19 @@ class Agent:
                 df = pd.read_csv(entry.path, skipinitialspace = True)
                 df = df.astype({c: np.float32 for c in df.select_dtypes(include = "float64").columns})
 
-                self.replays_states_actions.append(df[["x", "y", "z", "yaw", "pitch", "roll", "steer", "gas", "brake"]][1:].to_numpy())
+                self.replays_states_actions.append(df[["x", "y", "z", "yaw", "pitch", "roll", "steer", "gas", "brake"]][1::self.REPLAY_POINTS_ONE_EVERY].to_numpy())
 
                 # append another two columns:
                 # * index of the (state, action) in the replay, used when computing the reward. (e.g. a column with 0/1/2/...)
                 # * entry id. used when computing the state image. (e.g. a column with eid/eid/eid/...)
                 self.replays_states_actions[-1] = np.hstack([
                     self.replays_states_actions[-1],
-                    np.arange(len(self.replays_states_actions[-1])).reshape(-1, 1),
+                    (np.arange(len(self.replays_states_actions[-1])) * self.REPLAY_POINTS_ONE_EVERY).reshape(-1, 1),
                     eid * np.ones((len(self.replays_states_actions[-1]), 1))
                 ])
 
         self.replays_states_actions = np.vstack(self.replays_states_actions)
+
 
         # stochastically map all steer values which aren't full left/right or center to one of those.
         for i in range(len(self.replays_states_actions)):
@@ -77,6 +90,7 @@ class Agent:
 
         self.replays_kdt = KDTree(self.replays_states_actions[:, [self.rsa_ht["x"], self.rsa_ht["y"], self.rsa_ht["z"]]])
         self.replays_states_actions = torch.from_numpy(self.replays_states_actions)
+        self.reward2_visited = np.zeros(len(self.replays_states_actions), dtype = np.bool_)
 
         # the model's parameters, each fixed point from self.replays_states_actions has an amplitude and a standard deviation.
         self.fps_amp = torch.nn.Parameter(torch.zeros(len(self.replays_states_actions)))
@@ -91,7 +105,7 @@ class Agent:
         # debug metrics:
         self.dbg_tstart = time.time()
         self.dbg_log = open(f"{utils.LOG_OUTPUT_DIR_PREFIX}q_fixed_points_{int(self.dbg_tstart)}.txt", "w")
-        self.dbg_ht = {"receive_new_state": 0.0, "next_action": 0.0}
+        self.dbg_ht = {"receive_new_state": 0.0, "next_action": 0.0, "sum_reward_passive": 0.0, "sum_reward_active2": 0.0}
 
         print(f"agent_q_fixed_points loaded.")
 
@@ -112,6 +126,9 @@ class Agent:
         self.actions = []
         self.rewards = []
         self.episode_ind += 1
+        self.reward2_visited.fill(False)
+        self.passive_reward_bad_streak = 0
+        self.dbg_ht = {x: 0.0 for x in self.dbg_ht}
 
     """
     We call this from episode_ended().
@@ -131,36 +148,33 @@ class Agent:
             actions = [action for _, action, _, _ in samples]
             rewards = torch.tensor([reward for _, _, reward, _ in samples])
             next_states = torch.stack([next_state if next_state is not None else torch.zeros_like(state) for state, _, _, next_state in samples])
-            next_state_end = [next_state is None for _, _, _, next_state in samples]
+            next_state_end = torch.tensor([next_state is None for _, _, _, next_state in samples])
 
-            q_hat, q_target = [], []
+            # fp_scores.shape = (BS, FPS) -- batch size, fixed point size.
+            fp_scores = -torch.linalg.norm(states.unsqueeze(dim = 1) - self.replays_states_actions[:, :3], dim = -1) / torch.exp(self.fps_std) + self.fps_amp
+            action_indexes = torch.tensor([utils.ACTION_INDEX_HT[action] for action in actions])
 
-            for state, action, reward, next_state, is_end_next_state, near_indexes, near_next_indexes in zip(
-                states, actions, rewards, next_states, next_state_end,
-                self.replays_kdt.query_radius(states, r = self.POINTS_RADIUS),
-                self.replays_kdt.query_radius(next_states, r = self.POINTS_RADIUS)
-            ):
-                fp_scores = -torch.linalg.norm(state - self.replays_states_actions[near_indexes, :3], dim = 1) / torch.exp(self.fps_std[near_indexes]) + self.fps_amp[near_indexes]
+            q_hat = torch.where(
+                self.fps_masks[action_indexes].sum(dim=1) < 1e-10,
+                -self.inf,
+                torch.where(self.fps_masks[action_indexes], fp_scores, torch.zeros_like(fp_scores)).sum(dim=1) / self.fps_masks[action_indexes].sum(dim=1)
+            )
 
-                ni_mask = torch.all(self.replays_states_actions[near_indexes, self.rsa_ht["steer"]: self.rsa_ht["steer"] + 3] == torch.tensor(action), dim=1)
-                ni_count = ni_mask.sum()
-                q_hat.append(fp_scores[ni_mask].sum() / ni_count if ni_count > 0 else torch.tensor(-self.inf))
+            with torch.no_grad():
+                fp_scores_next = -torch.linalg.norm(next_states.unsqueeze(dim = 1) - self.replays_states_actions[:, :3], dim = -1) / torch.exp(self.fps_std) + self.fps_amp
 
-                with torch.no_grad():
-                    if is_end_next_state:
-                        q_target.append((1 - self.Q_LR) * q_hat[-1] + self.Q_LR * reward)
-                    else:
-                        fp_scores_next = -torch.linalg.norm(next_state - self.replays_states_actions[near_next_indexes, :3], dim=1) / torch.exp(self.fps_std[near_next_indexes]) + self.fps_amp[near_next_indexes]
+                q_hat_next_max = torch.where(
+                    self.fps_masks.sum(dim = -1) < 1e-10,
+                    -self.inf + torch.zeros(self.BATCH_SIZE, len(utils.VALUES_ACTIONS)),
+                    torch.where(
+                        self.fps_masks,
+                        fp_scores_next.unsqueeze(dim = 1),
+                        torch.zeros(self.BATCH_SIZE, len(utils.VALUES_ACTIONS), len(self.replays_states_actions)) # broadcast all to (BS, |A|, FPS).
+                    ).sum(dim = -1) / self.fps_masks.sum(dim = -1)
+                ).max(dim = 1).values
 
-                        best_q_next = torch.tensor(-self.inf)
-                        for a in utils.VALUES_ACTIONS:
-                            ni_mask = torch.all(self.replays_states_actions[near_next_indexes, self.rsa_ht["steer"]: self.rsa_ht["steer"] + 3] == torch.tensor(a), dim=1)
-                            ni_count = ni_mask.sum()
-                            best_q_next = max(best_q_next, fp_scores_next[ni_mask].sum() / ni_count if ni_count > 0 else torch.tensor(-self.inf))
-
-                        q_target.append((1 - self.Q_LR) * q_hat[-1] + self.Q_LR * (reward + self.DISCOUNT_FACTOR * best_q_next))
-
-            q_hat, q_target = torch.stack(q_hat), torch.stack(q_target)
+                # q_target = torch.where(next_state_end, )
+                q_target = (1 - self.Q_LR) * q_hat + self.Q_LR * (rewards + self.DISCOUNT_FACTOR * torch.where(next_state_end, torch.zeros_like(q_hat), q_hat_next_max))
 
             if self.fps_amp.grad is not None: self.fps_amp.grad.zero_()
             if self.fps_std.grad is not None: self.fps_std.grad.zero_()
@@ -202,15 +216,20 @@ class Agent:
             self.rewards[-1] += reward_coef * (utils.MAX_TIME // utils.GAP_TIME - (len(self.states) - 1))
 
         # we put all updates into self.replay_buffer here.
-        for i in range(len(self.actions)):
+        cnt_repeating_actions = int(round(self.CNT_REPEATING_ACTIONS.get(self.episode_ind)))
+        for i in range(0, len(self.actions), cnt_repeating_actions):
+            j = i + cnt_repeating_actions
+
             self.priority_replay_buffer.append(
-                item = (self.states[i], self.actions[i], self.rewards[i], self.states[i+1] if i+1 < len(self.states) else None),
+                item = (self.states[i][:3], self.actions[i], sum(self.rewards[i: j]), self.states[j][:3] if j < len(self.states) else None),
                 weight = 1.0
             )
 
+        print()
         for dbg_str in [
             f"Episode {self.episode_ind}:",
             f"Rewards: min = {round(min(self.rewards), 3)}, avg = {round(sum(self.rewards) / len(self.rewards), 3)}, max = {round(max(self.rewards), 3)}, sum = {round(sum(self.rewards), 3)}",
+            f"Rewards: passive: {round(self.dbg_ht['sum_reward_passive'], 3)}, active 2: {round(self.dbg_ht['sum_reward_active2'], 3)}",
             f"Time from start: {round(time.time() - self.dbg_tstart, 3)}, this episode in receive_new_state: {round(self.dbg_ht['receive_new_state'], 3)}, next_action: {round(self.dbg_ht['next_action'], 3)}"
         ]:
             self.dbg_log.write(dbg_str + "\n"); self.dbg_log.flush()
@@ -244,12 +263,15 @@ class Agent:
     def receive_new_state(self, state: tuple):
         tstart = time.time()
 
-        self.states.append(torch.tensor(state[:3]))
+        self.states.append(torch.tensor(state[:6])) # x/y/z/yaw/pitch/roll.
 
         is_state_too_bad = False
         # e.g. too far from other racing lines or too much time has passed <=> self.states array length is too big.
         # or too far away from any replay point.
         if len(self.states) * utils.GAP_TIME > utils.MAX_TIME:
+            is_state_too_bad = True
+
+        if self.passive_reward_bad_streak >= self.PASSIVE_REWARD_MAX_BAD_STREAK:
             is_state_too_bad = True
 
         self.dbg_ht["receive_new_state"] += time.time() - tstart
@@ -267,29 +289,54 @@ class Agent:
     def next_action(self):
         tstart = time.time()
 
-        near_indexes = self.replays_kdt.query_radius([self.states[-1]], r = self.POINTS_RADIUS)[0]
+        if len(self.actions) % int(round(self.CNT_REPEATING_ACTIONS.get(self.episode_ind))):
+            # just copy the last action.
+            self.actions.append(self.actions[-1])
+        else:
+            # the last state's scores against all fixed points:
+            fp_scores = -torch.linalg.norm(self.states[-1][:3] - self.replays_states_actions[:, :3], dim = 1) / torch.exp(self.fps_std) + self.fps_amp
 
-        # the last state's scores against all fixed points:
-        fp_scores = -torch.linalg.norm(self.states[-1] - self.replays_states_actions[near_indexes, :3], dim = 1) / torch.exp(self.fps_std[near_indexes]) + self.fps_amp[near_indexes]
+            # we compute for each action the mean estimated q score.
+            q_hat = torch.tensor([
+                fp_scores[self.fps_masks[i]].sum() / self.fps_masks[i].sum() if self.fps_masks[i].sum() > 0 else -self.inf
+                for i in range(len(utils.VALUES_ACTIONS))
+            ])
 
-        # we compute for each action the mean estimated q score.
+            temp = self.SOFTMAX_SCHEDULER.get(self.episode_ind)
 
-        q_hat = []
-        for action in utils.VALUES_ACTIONS:
-            ni_mask = torch.all(self.replays_states_actions[near_indexes, self.rsa_ht["steer"]: self.rsa_ht["steer"] + 3] == torch.tensor(action), dim=1)
-            ni_count = ni_mask.sum()
-            q_hat.append(fp_scores[ni_mask].sum() / ni_count if ni_count > 0 else torch.tensor(-self.inf))
+            action_index = F.softmax(q_hat / temp, dim=0).multinomial(num_samples=1).item() if self.episode_ind % self.dbg_every != 0 else q_hat.argmax().item()
+            self.actions.append(utils.VALUES_ACTIONS[action_index])
 
-        q_hat = torch.stack(q_hat)
+            # print(f"{self.episode_ind = }, {len(self.actions) = }, q_hat = {np.round(q_hat.numpy()[:3], 3)}, action distribution = {np.round(F.softmax(q_hat/temp, dim=0).numpy()[:3], 3)}, {action_index = }")
+            print(f"({action_index}, {round(F.softmax(q_hat/temp, dim=0)[action_index].item(), 3)}), ", end = '')
 
-        temp = self.SOFTMAX_SCHEDULER.get(self.episode_ind)
-        action_index = F.softmax(q_hat / temp, dim=0).multinomial(num_samples=1).item() if self.episode_ind % self.dbg_every != 0 else q_hat.argmax().item()
+        # since we just computed the next action, we can also compute the reward given here as well.
+        reward0 = 0
 
-        self.actions.append(utils.VALUES_ACTIONS[action_index])
+        # passive reward: distance travelled between the last two states. only count for X/Z, as we need to prevent falling from the map as a reward.
+        if len(self.states) > 1:
+            reward0 = torch.linalg.norm(self.states[-1][[utils.IND_X, utils.IND_Z]] - self.states[-2][[utils.IND_X, utils.IND_Z]]).item()
 
-        self.rewards.append(-1)
+        self.passive_reward_bad_streak = self.passive_reward_bad_streak + 1 if reward0 < self.PASSIVE_REWARD_BAD_STREAK_BOUND else 0
 
-        # TODO: reward pasiv pentru distanta parcursa + reward activ daca am ajuns intr-un punct mai repede decat replay-urile.
-        # TODO: mai putine actiuni posibile.
+        # active reward 2: award if location is close to replay point, but we got there quicker than the replay.
+        reward2 = 0
 
+        indexes = self.replays_kdt.query_radius([self.states[-1][:3]], r = self.REWARD2_RADIUS)[0]
+        frame_at_replay = self.replays_states_actions[indexes, self.rsa_ht["replay_index"]]  # at what frame in the replay does the replay hit the close point.
+        for ind, replay_frame in zip(indexes, frame_at_replay):
+            if replay_frame >= self.REWARD2_MIN_FRAME and not self.reward2_visited[ind] and\
+                    utils.radian_distance(self.states[-1][utils.IND_YAW], self.replays_states_actions[ind, self.rsa_ht["yaw"]], self.REWARD2_YPR_RADIAN_DIFF) and \
+                    utils.radian_distance(self.states[-1][utils.IND_PITCH], self.replays_states_actions[ind, self.rsa_ht["pitch"]], self.REWARD2_YPR_RADIAN_DIFF) and \
+                    utils.radian_distance(self.states[-1][utils.IND_ROLL], self.replays_states_actions[ind, self.rsa_ht["roll"]], self.REWARD2_YPR_RADIAN_DIFF):
+                self.reward2_visited[ind] = True
+                frame = len(self.states) - 1
+
+                # we reward an agent if it reaches a state faster than a replay.
+                reward2 += math.exp(min(self.REWARD2_MAX_EXPONENT, (replay_frame - frame) * self.REWARD2_COEF))
+
+        self.rewards.append(reward0 + reward2)
+
+        self.dbg_ht["sum_reward_passive"] += reward0
+        self.dbg_ht["sum_reward_active2"] += reward2
         self.dbg_ht["next_action"] += time.time() - tstart
