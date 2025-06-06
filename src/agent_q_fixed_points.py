@@ -30,13 +30,14 @@ class Agent:
 
         self.BATCH_SIZE = 128
         self.Q_LR = 1e-2
-        self.LR = 3e-3
+        self.LR = 1e-2 # 3e-3
         self.REPLAY_BUFSIZE = 3 * 10 ** 3
 
+        self.POINTS_RADIUS = 30
         self.DISCOUNT_FACTOR = 0.99
 
-        self.SOFTMAX_SCHEDULER = utils.DecayScheduler(start=10, end=0.5, decay=500) # temperature for the softmax policy. (10, 1, 500)
-        self.CNT_REPEATING_ACTIONS = utils.DecayScheduler(start=50, end=15, decay=500)  # will choose a new action every CNT_REPEATING_ACTIONS.
+        self.SOFTMAX_SCHEDULER = utils.DecayScheduler(start=10, end=1.0, decay=500) # temperature for the softmax policy. (10, 1, 500)
+        self.CNT_REPEATING_ACTIONS = utils.DecayScheduler(start=50, end=15, decay=1000)  # will choose a new action every CNT_REPEATING_ACTIONS.
 
         self.REWARD_END_EPISODE_COEF_START = 10.0
         self.REWARD_END_EPISODE_COEF_END = 30.0
@@ -94,12 +95,12 @@ class Agent:
 
         # the model's parameters, each fixed point from self.replays_states_actions has an amplitude and a standard deviation.
         self.fps_amp = torch.nn.Parameter(torch.zeros(len(self.replays_states_actions)))
-        self.fps_std = torch.nn.Parameter(torch.zeros(len(self.replays_states_actions)))
+        self.fps_std = torch.nn.Parameter(torch.ones(len(self.replays_states_actions)))
 
         # masks for which points represent which action.
         self.fps_masks = torch.stack([
-            torch.all(self.replays_states_actions[:, self.rsa_ht["steer"]: self.rsa_ht["steer"] + 3] == torch.tensor(steer_gas_brake), dim=1)
-            for steer_gas_brake in utils.VALUES_ACTIONS
+            torch.all(self.replays_states_actions[:, self.rsa_ht["steer"]: self.rsa_ht["steer"] + 3] == torch.tensor(action), dim=1)
+            for action in utils.VALUES_ACTIONS
         ])
 
         # debug metrics:
@@ -148,33 +149,49 @@ class Agent:
             actions = [action for _, action, _, _ in samples]
             rewards = torch.tensor([reward for _, _, reward, _ in samples])
             next_states = torch.stack([next_state if next_state is not None else torch.zeros_like(state) for state, _, _, next_state in samples])
-            next_state_end = torch.tensor([next_state is None for _, _, _, next_state in samples])
+            next_state_end = [next_state is None for _, _, _, next_state in samples]
 
-            # fp_scores.shape = (BS, FPS) -- batch size, fixed point size.
-            fp_scores = -torch.linalg.norm(states.unsqueeze(dim = 1) - self.replays_states_actions[:, :3], dim = -1) / torch.exp(self.fps_std) + self.fps_amp
-            action_indexes = torch.tensor([utils.ACTION_INDEX_HT[action] for action in actions])
+            arr_near_indexes = self.replays_kdt.query_radius(states, r=self.POINTS_RADIUS)
+            arr_near_next_indexes = self.replays_kdt.query_radius(next_states, r=self.POINTS_RADIUS)
 
-            q_hat = torch.where(
-                self.fps_masks[action_indexes].sum(dim=1) < 1e-10,
-                -self.inf,
-                torch.where(self.fps_masks[action_indexes], fp_scores, torch.zeros_like(fp_scores)).sum(dim=1) / self.fps_masks[action_indexes].sum(dim=1)
-            )
 
-            with torch.no_grad():
-                fp_scores_next = -torch.linalg.norm(next_states.unsqueeze(dim = 1) - self.replays_states_actions[:, :3], dim = -1) / torch.exp(self.fps_std) + self.fps_amp
+            q_hat, q_target = [], []
+            for state, action, reward, next_state, is_end_next_state, near_indexes, near_next_indexes in zip(
+                states, actions, rewards, next_states, next_state_end,
+                arr_near_indexes, arr_near_next_indexes
+            ):
+                # we consider/normalize only by the count of points close enough to us.
+                fp_scores = torch.exp(-torch.linalg.norm(state - self.replays_states_actions[near_indexes, :3], dim=1) / (self.fps_std[near_indexes] + 1e-10) ** 2 + self.fps_amp[near_indexes])
 
-                q_hat_next_max = torch.where(
-                    self.fps_masks.sum(dim = -1) < 1e-10,
-                    -self.inf + torch.zeros(self.BATCH_SIZE, len(utils.VALUES_ACTIONS)),
-                    torch.where(
-                        self.fps_masks,
-                        fp_scores_next.unsqueeze(dim = 1),
-                        torch.zeros(self.BATCH_SIZE, len(utils.VALUES_ACTIONS), len(self.replays_states_actions)) # broadcast all to (BS, |A|, FPS).
-                    ).sum(dim = -1) / self.fps_masks.sum(dim = -1)
-                ).max(dim = 1).values
+                action_index = utils.ACTION_INDEX_HT[action]
+                ni_mask = self.fps_masks[action_index, near_indexes]
+                ni_count = ni_mask.sum()
 
-                # q_target = torch.where(next_state_end, )
-                q_target = (1 - self.Q_LR) * q_hat + self.Q_LR * (rewards + self.DISCOUNT_FACTOR * torch.where(next_state_end, torch.zeros_like(q_hat), q_hat_next_max))
+                q_hat_candidate = fp_scores[ni_mask].sum() / ni_count if ni_count > 0 else None
+
+                with (torch.no_grad()):
+                    if is_end_next_state:
+                        q_target_candidate = (1 - self.Q_LR) * q_hat_candidate + self.Q_LR * reward if q_hat_candidate is not None else None
+                    else:
+                        fp_scores_next = torch.exp(-torch.linalg.norm(next_state - self.replays_states_actions[near_next_indexes, :3], dim=1) / (self.fps_std[near_next_indexes] + 1e-10) ** 2 + self.fps_amp[near_next_indexes])
+
+                        ni_masks = self.fps_masks[:, near_next_indexes]
+                        ni_counts = ni_masks.sum(dim = 1)
+                        ni_means = torch.where(
+                            ni_counts > 0,
+                            torch.where(ni_masks, fp_scores_next, torch.zeros_like(ni_masks)).sum(dim=1) / ni_counts,
+                            -self.inf
+                        )
+
+                        best_q_next = ni_means.max().item()
+
+                        q_target_candidate = (1 - self.Q_LR) * q_hat_candidate + self.Q_LR * (reward + self.DISCOUNT_FACTOR * best_q_next) if best_q_next > -self.inf and q_hat_candidate is not None else None
+
+                if q_hat_candidate is not None and q_target_candidate is not None:
+                    q_hat.append(q_hat_candidate)
+                    with torch.no_grad(): q_target.append(q_target_candidate)
+
+            q_hat, q_target = torch.stack(q_hat), torch.stack(q_target)
 
             if self.fps_amp.grad is not None: self.fps_amp.grad.zero_()
             if self.fps_std.grad is not None: self.fps_std.grad.zero_()
@@ -225,7 +242,8 @@ class Agent:
                 weight = 1.0
             )
 
-        print()
+        self.qlearn_update()
+
         for dbg_str in [
             f"Episode {self.episode_ind}:",
             f"Rewards: min = {round(min(self.rewards), 3)}, avg = {round(sum(self.rewards) / len(self.rewards), 3)}, max = {round(max(self.rewards), 3)}, sum = {round(sum(self.rewards), 3)}",
@@ -234,8 +252,6 @@ class Agent:
         ]:
             self.dbg_log.write(dbg_str + "\n"); self.dbg_log.flush()
             print(dbg_str)
-
-        self.qlearn_update()
 
         utils.write_processed_output(
             fname = f"{utils.PARTIAL_OUTPUT_DIR_PREFIX}{int(self.dbg_tstart)}_{self.episode_ind}_{(len(self.states) - 1) * utils.GAP_TIME}.txt",
@@ -294,11 +310,11 @@ class Agent:
             self.actions.append(self.actions[-1])
         else:
             # the last state's scores against all fixed points:
-            fp_scores = -torch.linalg.norm(self.states[-1][:3] - self.replays_states_actions[:, :3], dim = 1) / torch.exp(self.fps_std) + self.fps_amp
+            fp_scores = torch.exp(-torch.linalg.norm(self.states[-1][:3] - self.replays_states_actions[:, :3], dim = 1) / (self.fps_std**2 + 1e-10) + self.fps_amp)
 
             # we compute for each action the mean estimated q score.
             q_hat = torch.tensor([
-                fp_scores[self.fps_masks[i]].sum() / self.fps_masks[i].sum() if self.fps_masks[i].sum() > 0 else -self.inf
+                fp_scores[self.fps_masks[i]].sum() if self.fps_masks[i].sum() > 0 else -self.inf # / self.fps_masks[i].sum()
                 for i in range(len(utils.VALUES_ACTIONS))
             ])
 
@@ -307,8 +323,8 @@ class Agent:
             action_index = F.softmax(q_hat / temp, dim=0).multinomial(num_samples=1).item() if self.episode_ind % self.dbg_every != 0 else q_hat.argmax().item()
             self.actions.append(utils.VALUES_ACTIONS[action_index])
 
-            # print(f"{self.episode_ind = }, {len(self.actions) = }, q_hat = {np.round(q_hat.numpy()[:3], 3)}, action distribution = {np.round(F.softmax(q_hat/temp, dim=0).numpy()[:3], 3)}, {action_index = }")
-            print(f"({action_index}, {round(F.softmax(q_hat/temp, dim=0)[action_index].item(), 3)}), ", end = '')
+            print(f"{self.episode_ind = }, {len(self.actions) = }, q_hat = {np.round(q_hat.numpy()[:3], 3)}, action distribution = {np.round(F.softmax(q_hat/temp, dim=0).numpy()[:3], 3)}, {action_index = }")
+            # print(f"({action_index}, {round(F.softmax(q_hat/temp, dim=0)[action_index].item(), 3)}), ", end = '')
 
         # since we just computed the next action, we can also compute the reward given here as well.
         reward0 = 0
