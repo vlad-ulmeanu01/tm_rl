@@ -33,11 +33,10 @@ class Agent:
         self.LR = 1e-2 # 3e-3
         self.REPLAY_BUFSIZE = 3 * 10 ** 3
 
-        # self.POINTS_RADIUS = 40 # self.replays_kdt.query_radius(states, r=self.POINTS_RADIUS)
-        self.K_CLOSEST_POINTS = 250
+        self.POINTS_RADIUS = 30
         self.DISCOUNT_FACTOR = 0.99
 
-        self.SOFTMAX_SCHEDULER = utils.DecayScheduler(start=1e-2, end=0, decay=500) # temperature for the softmax policy. (10, 1, 500).
+        self.SOFTMAX_SCHEDULER = utils.DecayScheduler(start=1e-2, end=0, decay=500) # temperature for the softmax policy. (10, 1, 500)
         self.CNT_REPEATING_ACTIONS = utils.DecayScheduler(start=50, end=15, decay=1000)  # will choose a new action every CNT_REPEATING_ACTIONS.
 
         self.REWARD_END_EPISODE_COEF_START = 10.0
@@ -58,7 +57,6 @@ class Agent:
         self.passive_reward_bad_streak = 0
 
         self.priority_replay_buffer = qnet_conv_helper.WeightedDeque(maxlen = self.REPLAY_BUFSIZE)  # we only use a prioritised replay buffer.
-        self.biggest_td_error = 1.0 # we insert the first time any object with the highest TD error we encountered s.t. it has a bigger chance of being selected at least once.
 
         # load fixed points:
         self.replays_states_actions = []
@@ -80,6 +78,7 @@ class Agent:
                 ])
 
         self.replays_states_actions = np.vstack(self.replays_states_actions, dtype = np.float32)
+
 
         # stochastically map all steer values which aren't full left/right or center to one of those.
         for i in range(len(self.replays_states_actions)):
@@ -152,24 +151,17 @@ class Agent:
             next_states = torch.stack([next_state if next_state is not None else torch.zeros_like(state) for state, _, _, next_state in samples])
             next_state_end = [next_state is None for _, _, _, next_state in samples]
 
-            arr_near_indexes = self.replays_kdt.query(states[:, :3], k = self.K_CLOSEST_POINTS, return_distance = False)
-            arr_near_next_indexes = self.replays_kdt.query(next_states[:, :3], k = self.K_CLOSEST_POINTS, return_distance = False)
+            arr_near_indexes = self.replays_kdt.query_radius(states, r=self.POINTS_RADIUS)
+            arr_near_next_indexes = self.replays_kdt.query_radius(next_states, r=self.POINTS_RADIUS)
+
 
             q_hat, q_target = [], []
-            for batch_id, state, action, reward, next_state, is_end_next_state, near_indexes, near_next_indexes in zip(
-                itertools.count(), states, actions, rewards, next_states, next_state_end,
+            for state, action, reward, next_state, is_end_next_state, near_indexes, near_next_indexes in zip(
+                states, actions, rewards, next_states, next_state_end,
                 arr_near_indexes, arr_near_next_indexes
             ):
                 # we consider/normalize only by the count of points close enough to us.
-                fp_scores = torch.exp(
-                    (
-                        -torch.linalg.norm(state[:3] - self.replays_states_actions[near_indexes, :3], dim=1) -
-                        torch.exp(torch.minimum(
-                            torch.minimum((state[3:] - self.replays_states_actions[near_indexes, 3:6]).abs(),
-                                          (state[3:] - 2 * math.pi - self.replays_states_actions[near_indexes, 3:6]).abs()),
-                                          (state[3:] + 2 * math.pi - self.replays_states_actions[near_indexes, 3:6]).abs())).sum(dim=1)
-                    ) / (self.fps_std[near_indexes] ** 2 + 1e-10) + self.fps_amp[near_indexes]
-                )
+                fp_scores = torch.exp(-torch.linalg.norm(state - self.replays_states_actions[near_indexes, :3], dim=1) / (self.fps_std[near_indexes] + 1e-10) ** 2 + self.fps_amp[near_indexes])
 
                 action_index = utils.ACTION_INDEX_HT[action]
                 ni_mask = self.fps_masks[action_index, near_indexes]
@@ -177,18 +169,11 @@ class Agent:
 
                 q_hat_candidate = fp_scores[ni_mask].sum() / ni_count if ni_count > 0 else None
 
-                with torch.no_grad():
+                with (torch.no_grad()):
                     if is_end_next_state:
                         q_target_candidate = (1 - self.Q_LR) * q_hat_candidate + self.Q_LR * reward if q_hat_candidate is not None else None
                     else:
-                        fp_scores_next = torch.exp(
-                            (
-                                -torch.linalg.norm(next_state[:3] - self.replays_states_actions[near_next_indexes, :3], dim=1) -
-                                torch.exp(torch.minimum(torch.minimum((next_state[3:] - self.replays_states_actions[near_next_indexes, 3:6]).abs(),
-                                                                      (next_state[3:] - 2 * math.pi - self.replays_states_actions[near_next_indexes, 3:6]).abs()),
-                                                                      (next_state[3:] + 2 * math.pi - self.replays_states_actions[near_next_indexes, 3:6]).abs())).sum(dim = 1)
-                            ) / (self.fps_std[near_next_indexes] ** 2 + 1e-10) + self.fps_amp[near_next_indexes]
-                        )
+                        fp_scores_next = torch.exp(-torch.linalg.norm(next_state - self.replays_states_actions[near_next_indexes, :3], dim=1) / (self.fps_std[near_next_indexes] + 1e-10) ** 2 + self.fps_amp[near_next_indexes])
 
                         ni_masks = self.fps_masks[:, near_next_indexes]
                         ni_counts = ni_masks.sum(dim = 1)
@@ -202,17 +187,9 @@ class Agent:
 
                         q_target_candidate = (1 - self.Q_LR) * q_hat_candidate + self.Q_LR * (reward + self.DISCOUNT_FACTOR * best_q_next) if best_q_next > -self.inf and q_hat_candidate is not None else None
 
-                new_buff_weight = 0.0
                 if q_hat_candidate is not None and q_target_candidate is not None:
                     q_hat.append(q_hat_candidate)
-                    with torch.no_grad():
-                        q_target.append(q_target_candidate)
-                        abs_td_error = abs(q_hat_candidate.item() - q_target_candidate.item())
-
-                    self.biggest_td_error = max(self.biggest_td_error, abs_td_error)
-                    new_buff_weight = abs_td_error ** 0.7
-
-                self.priority_replay_buffer.update_weight(index = sample_indexes[batch_id], new_weight = new_buff_weight)
+                    with torch.no_grad(): q_target.append(q_target_candidate)
 
             q_hat, q_target = torch.stack(q_hat), torch.stack(q_target)
 
@@ -261,8 +238,8 @@ class Agent:
             j = i + cnt_repeating_actions
 
             self.priority_replay_buffer.append(
-                item = (self.states[i], self.actions[i], sum(self.rewards[i: j]), self.states[j] if j < len(self.states) else None),
-                weight = self.biggest_td_error
+                item = (self.states[i][:3], self.actions[i], sum(self.rewards[i: j]), self.states[j][:3] if j < len(self.states) else None),
+                weight = 1.0
             )
 
         self.qlearn_update()
@@ -332,33 +309,21 @@ class Agent:
             # just copy the last action.
             self.actions.append(self.actions[-1])
         else:
-            # the last state's scores against nearby fixed points:
-
-            near_indexes = self.replays_kdt.query([self.states[-1][:3]], k = self.K_CLOSEST_POINTS, return_distance = False)[0]
-
-            fp_scores = torch.exp(
-                (
-                    -torch.linalg.norm(self.states[-1][:3] - self.replays_states_actions[near_indexes, :3], dim=1) -
-                    torch.exp(torch.minimum(
-                        torch.minimum((self.states[-1][3:] - self.replays_states_actions[near_indexes, 3:6]).abs(),
-                                      (self.states[-1][3:] - 2 * math.pi - self.replays_states_actions[near_indexes, 3:6]).abs()),
-                                      (self.states[-1][3:] + 2 * math.pi - self.replays_states_actions[near_indexes, 3:6]).abs())).sum(dim=1)
-                ) / (self.fps_std[near_indexes] ** 2 + 1e-10) + self.fps_amp[near_indexes]
-            )
+            # the last state's scores against all fixed points:
+            fp_scores = torch.exp(-torch.linalg.norm(self.states[-1][:3] - self.replays_states_actions[:, :3], dim = 1) / (self.fps_std**2 + 1e-10) + self.fps_amp)
 
             # we compute for each action the mean estimated q score.
             temp = self.SOFTMAX_SCHEDULER.get(self.episode_ind) # we don't do softmax here, we just divide by sum(q_hat). temp is additive to any q_hat term.
 
-            ni_masks = self.fps_masks[:, near_indexes]
-            ni_counts = ni_masks.sum(dim=1)
-            q_hat = torch.where(ni_counts > 0, torch.where(ni_masks, fp_scores, torch.zeros_like(ni_masks)).sum(dim=1) / ni_counts + temp, 0.0)
+            ni_counts = self.fps_masks.sum(dim=1)
+            q_hat = torch.where(ni_counts > 0, torch.where(self.fps_masks, fp_scores, torch.zeros_like(self.fps_masks)).sum(dim=1) / ni_counts + temp, 0.0)
 
             action_index = (q_hat / q_hat.sum()).multinomial(num_samples=1).item() if self.episode_ind % self.dbg_every != 0 else q_hat.argmax().item()
             self.actions.append(utils.VALUES_ACTIONS[action_index])
 
-            print(f"{self.episode_ind = }, {len(self.actions) = }, q_hat = {np.round(q_hat.numpy()[:3], 3)}, action distribution = {np.round((q_hat / q_hat.sum()).numpy()[:3], 3)}, {action_index = }")
+            print(
+                f"{self.episode_ind = }, {len(self.actions) = }, q_hat = {np.round(q_hat.numpy()[:3], 3)}, action distribution = {np.round((q_hat / q_hat.sum()).numpy()[:3], 3)}, {action_index = }")
             # print(f"pre action index selection q_hat = {np.round(q_hat.numpy(), 3)}, {sum(ni_counts) = }", flush = True)
-
 
         # since we just computed the next action, we can also compute the reward given here as well.
         reward0 = 0
