@@ -81,7 +81,6 @@ class Agent:
 
         self.replays_states_actions = np.vstack(self.replays_states_actions, dtype = np.float32)
 
-
         # stochastically map all steer values which aren't full left/right or center to one of those.
         for i in range(len(self.replays_states_actions)):
             steer = self.replays_states_actions[i, self.rsa_ht["steer"]]
@@ -95,15 +94,12 @@ class Agent:
         self.replays_states_actions = torch.from_numpy(self.replays_states_actions)
         self.reward2_visited = np.zeros(len(self.replays_states_actions), dtype = np.bool_)
 
-        # the model's parameters, each fixed point from self.replays_states_actions has an amplitude and a standard deviation.
-        self.fps_amp = torch.nn.Parameter(torch.zeros(len(self.replays_states_actions)))
-        self.fps_std = torch.nn.Parameter(torch.ones(len(self.replays_states_actions)))
+        # remember for each fixed point's action its action index.
+        self.fps_action_indexes = np.array([utils.ACTION_INDEX_HT[tuple(action.tolist())] for action in self.replays_states_actions[:, self.rsa_ht["steer"]: self.rsa_ht["steer"] + 3]])
 
-        # masks for which points represent which action.
-        # self.fps_masks = torch.stack([
-        #     torch.all(self.replays_states_actions[:, self.rsa_ht["steer"]: self.rsa_ht["steer"] + 3] == torch.tensor(action), dim=1)
-        #     for action in utils.VALUES_ACTIONS
-        # ])
+        # the model's parameters, each fixed point from self.replays_states_actions has an amplitude and a standard deviation.
+        self.fps_amp = torch.nn.Parameter(5 + torch.zeros(len(self.replays_states_actions)))
+        self.fps_std = torch.nn.Parameter(5 * torch.ones(len(self.replays_states_actions)))
 
         # debug metrics:
         self.dbg_tstart = time.time()
@@ -150,6 +146,7 @@ class Agent:
 
             states = torch.stack([state for state, _, _, _ in samples])
             actions = [action for _, action, _, _ in samples]
+            action_indexes = [utils.ACTION_INDEX_HT[action] for action in actions]
             rewards = torch.tensor([reward for _, _, reward, _ in samples])
             next_states = torch.stack([next_state if next_state is not None else torch.zeros_like(state) for state, _, _, next_state in samples])
             next_state_end = [next_state is None for _, _, _, next_state in samples]
@@ -158,8 +155,8 @@ class Agent:
             arr_near_next_indexes = self.replays_kdt.query_radius(next_states[:, :3], r=self.POINTS_RADIUS)
 
             q_hat, q_target = [], []
-            for state, action, reward, next_state, is_end_next_state, near_indexes, near_next_indexes in zip(
-                states, actions, rewards, next_states, next_state_end,
+            for state, action, action_index, reward, next_state, is_end_next_state, near_indexes, near_next_indexes in zip(
+                states, actions, action_indexes, rewards, next_states, next_state_end,
                 arr_near_indexes, arr_near_next_indexes
             ):
                 # we consider/normalize only by the count of points close enough to us.
@@ -169,13 +166,13 @@ class Agent:
                 )
 
                 # how does the perception of the agent's point change relative to the other points?
-                changed_actions, mask_throw_action = q_fixed_points_helper.cast_actions_by_yaw(
-                    yaw = state[self.rsa_ht["yaw"]],
-                    target_yaws = self.replays_states_actions[near_indexes, self.rsa_ht["yaw"]],
-                    target_actions = self.replays_states_actions[near_indexes, self.rsa_ht["steer"]: self.rsa_ht["steer"] + 3]
+                changed_action_indexes, mask_throw_action = q_fixed_points_helper.cast_actions_by_yaw(
+                    yaw = state[self.rsa_ht["yaw"]].item(),
+                    target_yaws = self.replays_states_actions[near_indexes, self.rsa_ht["yaw"]].numpy(),
+                    target_action_indexes = self.fps_action_indexes[near_indexes]
                 )
 
-                ni_mask = torch.where(mask_throw_action, False, torch.all(changed_actions == torch.tensor(action), dim=1))
+                ni_mask = torch.from_numpy(np.logical_and(changed_action_indexes == action_index, mask_throw_action ^ True))
                 ni_count = ni_mask.sum()
                 q_hat_candidate = fp_scores[ni_mask].sum() / ni_count if ni_count > 0 else None
 
@@ -189,18 +186,18 @@ class Agent:
                         )
 
                         # how does the perception of the agent's point change relative to the other points?
-                        changed_actions, mask_throw_action = q_fixed_points_helper.cast_actions_by_yaw(
-                            yaw = next_state[self.rsa_ht["yaw"]],
-                            target_yaws = self.replays_states_actions[near_next_indexes, self.rsa_ht["yaw"]],
-                            target_actions = self.replays_states_actions[near_next_indexes, self.rsa_ht["steer"]: self.rsa_ht["steer"] + 3]
+                        changed_action_indexes, mask_throw_action = q_fixed_points_helper.cast_actions_by_yaw(
+                            yaw = next_state[self.rsa_ht["yaw"]].item(),
+                            target_yaws = self.replays_states_actions[near_next_indexes, self.rsa_ht["yaw"]].numpy(),
+                            target_action_indexes = self.fps_action_indexes[near_next_indexes]
                         )
 
                         # compute the masks against the perceived actions. remember to mask away the fixed points whose actions are at a too weird of an angle.
-                        ni_masks = torch.where(
+                        ni_masks = torch.from_numpy(np.where(
                             mask_throw_action,
                             False,
-                            torch.stack([torch.all(changed_actions == torch.tensor(action), dim=1) for action in utils.VALUES_ACTIONS])
-                        )
+                            np.stack([changed_action_indexes == a_i for a_i in range(len(utils.VALUES_ACTIONS))])
+                        ))
                         ni_counts = ni_masks.sum(dim = 1)
                         ni_means = torch.where(
                             ni_counts > 0,
@@ -347,29 +344,32 @@ class Agent:
             temp = self.SOFTMAX_SCHEDULER.get(self.episode_ind)  # we don't do softmax here, we just divide by sum(q_hat). temp is additive to any q_hat term.
 
             # how does the perception of the agent's point change relative to the other points?
-            changed_actions, mask_throw_action = q_fixed_points_helper.cast_actions_by_yaw(
-                yaw = self.states[-1][self.rsa_ht["yaw"]],
-                target_yaws = self.replays_states_actions[:, self.rsa_ht["yaw"]],
-                target_actions = self.replays_states_actions[:, self.rsa_ht["steer"]: self.rsa_ht["steer"] + 3]
+            changed_action_indexes, mask_throw_action = q_fixed_points_helper.cast_actions_by_yaw(
+                yaw = self.states[-1][self.rsa_ht["yaw"]].item(),
+                target_yaws = self.replays_states_actions[:, self.rsa_ht["yaw"]].numpy(),
+                target_action_indexes = self.fps_action_indexes
             )
 
-            # TODO plot actions / changed actions..
-            torch.save(
-                {"state": self.states[-1][:3], "yaw": self.states[-1][self.rsa_ht["yaw"]], "fixed_states": self.replays_states_actions[:, :3],
-                 "target_actions": self.replays_states_actions[:, self.rsa_ht["steer"]: self.rsa_ht["steer"] + 3], "changed_actions": changed_actions},
-                f"../debug_logs/dbg_changed_actions_episode_{self.episode_ind}_{len(self.states)}.pt"
-            )
-
-            print(f"# fp actions before action cast: {torch.stack([torch.all(self.replays_states_actions[:, self.rsa_ht['steer']: self.rsa_ht['steer'] + 3] == torch.tensor(action), dim=1) for action in utils.VALUES_ACTIONS]).sum(dim=1)}", flush = True)
-            print(f"# fp actions after action cast: {torch.stack([torch.all(changed_actions == torch.tensor(action), dim=1) for action in utils.VALUES_ACTIONS]).sum(dim=1)}", flush = True)
+            # plot actions / changed actions..
+            # torch.save(
+            #     {
+            #         "state": self.states[-1][:3], "yaw": self.states[-1][self.rsa_ht["yaw"]], "fixed_states": self.replays_states_actions[:, :3],
+            #         "target_actions": self.replays_states_actions[:, self.rsa_ht["steer"]: self.rsa_ht["steer"] + 3],
+            #         "changed_action_indexes": changed_action_indexes
+            #     },
+            #     f"../debug_logs/dbg_changed_actions_episode_{self.episode_ind}_{len(self.states)}.pt"
+            # )
+            #
+            # print(f"# fp actions before action cast: {[(self.fps_action_indexes == a_i).sum() for a_i in range(len(utils.VALUES_ACTIONS))]}", flush = True)
+            # print(f"# fp actions after action cast: {[(changed_action_indexes == a_i).sum() for a_i in range(len(utils.VALUES_ACTIONS))]}", flush = True)
 
             # compute the masks against the perceived actions. remember to mask away the fixed points whose actions are at a too weird of an angle.
-            ni_masks = torch.where(
+
+            ni_masks = torch.from_numpy(np.where(
                 mask_throw_action,
                 False,
-                torch.stack([torch.all(changed_actions == torch.tensor(action), dim=1) for action in utils.VALUES_ACTIONS])
-            )
-
+                np.stack([changed_action_indexes == a_i for a_i in range(len(utils.VALUES_ACTIONS))])
+            ))
             ni_counts = ni_masks.sum(dim=1)
             q_hat = torch.where(
                 ni_counts > 0,

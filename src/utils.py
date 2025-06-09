@@ -38,7 +38,7 @@ ACTION_INDEX_HT = {action: i for i, action in zip(itertools.count(), VALUES_ACTI
 
 IND_X, IND_Y, IND_Z, IND_YAW, IND_PITCH, IND_ROLL, IND_VX, IND_VY, IND_VZ, IND_WHEEL_MATERIALS, IND_WHEEL_CONTACT = range(11)
 
-MAX_TIME_INBETWEEN_RUNS = 1.0 # maximum number of seconds that we can do computing between ending an episode and beginning another.
+MAX_TIME_INBETWEEN_RUNS = 1.25 # maximum number of seconds that we can do computing between ending an episode and beginning another.
 
 """
 MAX_TIME: maximum number of milliseconds we're willing to run a replay for.
