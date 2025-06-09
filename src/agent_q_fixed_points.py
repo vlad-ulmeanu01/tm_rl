@@ -56,6 +56,7 @@ class Agent:
         # hyperparameters end.
 
         self.passive_reward_bad_streak = 0
+        self.no_nearby_fixed_points = False
 
         self.priority_replay_buffer = qnet_conv_helper.WeightedDeque(maxlen = self.REPLAY_BUFSIZE)  # we only use a prioritised replay buffer.
 
@@ -99,10 +100,10 @@ class Agent:
         self.fps_std = torch.nn.Parameter(torch.ones(len(self.replays_states_actions)))
 
         # masks for which points represent which action.
-        self.fps_masks = torch.stack([
-            torch.all(self.replays_states_actions[:, self.rsa_ht["steer"]: self.rsa_ht["steer"] + 3] == torch.tensor(action), dim=1)
-            for action in utils.VALUES_ACTIONS
-        ])
+        # self.fps_masks = torch.stack([
+        #     torch.all(self.replays_states_actions[:, self.rsa_ht["steer"]: self.rsa_ht["steer"] + 3] == torch.tensor(action), dim=1)
+        #     for action in utils.VALUES_ACTIONS
+        # ])
 
         # debug metrics:
         self.dbg_tstart = time.time()
@@ -130,6 +131,7 @@ class Agent:
         self.episode_ind += 1
         self.reward2_visited.fill(False)
         self.passive_reward_bad_streak = 0
+        self.no_nearby_fixed_points = False
         self.dbg_ht = {x: 0.0 for x in self.dbg_ht}
 
     """
@@ -155,7 +157,6 @@ class Agent:
             arr_near_indexes = self.replays_kdt.query_radius(states[:, :3], r=self.POINTS_RADIUS)
             arr_near_next_indexes = self.replays_kdt.query_radius(next_states[:, :3], r=self.POINTS_RADIUS)
 
-
             q_hat, q_target = [], []
             for state, action, reward, next_state, is_end_next_state, near_indexes, near_next_indexes in zip(
                 states, actions, rewards, next_states, next_state_end,
@@ -163,16 +164,19 @@ class Agent:
             ):
                 # we consider/normalize only by the count of points close enough to us.
                 fp_scores = torch.exp(
-                    (
-                            -torch.linalg.norm(state[:3] - self.replays_states_actions[near_indexes, :3], dim=1) -
-                            q_fixed_points_helper.radian_distance_loss(state[3:], self.replays_states_actions[near_indexes, 3:6])
-                    ) / (self.fps_std[near_indexes] + 1e-10) ** 2 + self.fps_amp[near_indexes]
+                    -torch.linalg.norm(state[:3] - self.replays_states_actions[near_indexes, :3], dim=1)
+                    / (self.fps_std[near_indexes] + 1e-10) ** 2 + self.fps_amp[near_indexes]
                 )
 
-                action_index = utils.ACTION_INDEX_HT[action]
-                ni_mask = self.fps_masks[action_index, near_indexes]
-                ni_count = ni_mask.sum()
+                # how does the perception of the agent's point change relative to the other points?
+                changed_actions, mask_throw_action = q_fixed_points_helper.cast_actions_by_yaw(
+                    yaw = state[self.rsa_ht["yaw"]],
+                    target_yaws = self.replays_states_actions[near_indexes, self.rsa_ht["yaw"]],
+                    target_actions = self.replays_states_actions[near_indexes, self.rsa_ht["steer"]: self.rsa_ht["steer"] + 3]
+                )
 
+                ni_mask = torch.where(mask_throw_action, False, torch.all(changed_actions == torch.tensor(action), dim=1))
+                ni_count = ni_mask.sum()
                 q_hat_candidate = fp_scores[ni_mask].sum() / ni_count if ni_count > 0 else None
 
                 with torch.no_grad():
@@ -180,13 +184,23 @@ class Agent:
                         q_target_candidate = (1 - self.Q_LR) * q_hat_candidate + self.Q_LR * reward if q_hat_candidate is not None else None
                     else:
                         fp_scores_next = torch.exp(
-                            (
-                                -torch.linalg.norm(next_state[:3] - self.replays_states_actions[near_next_indexes, :3], dim=1) -
-                                q_fixed_points_helper.radian_distance_loss(next_state[3:], self.replays_states_actions[near_next_indexes, 3:6])
-                            ) / (self.fps_std[near_next_indexes] + 1e-10) ** 2 + self.fps_amp[near_next_indexes]
+                            -torch.linalg.norm(next_state[:3] - self.replays_states_actions[near_next_indexes, :3], dim=1)
+                            / (self.fps_std[near_next_indexes] + 1e-10) ** 2 + self.fps_amp[near_next_indexes]
                         )
 
-                        ni_masks = self.fps_masks[:, near_next_indexes]
+                        # how does the perception of the agent's point change relative to the other points?
+                        changed_actions, mask_throw_action = q_fixed_points_helper.cast_actions_by_yaw(
+                            yaw = next_state[self.rsa_ht["yaw"]],
+                            target_yaws = self.replays_states_actions[near_next_indexes, self.rsa_ht["yaw"]],
+                            target_actions = self.replays_states_actions[near_next_indexes, self.rsa_ht["steer"]: self.rsa_ht["steer"] + 3]
+                        )
+
+                        # compute the masks against the perceived actions. remember to mask away the fixed points whose actions are at a too weird of an angle.
+                        ni_masks = torch.where(
+                            mask_throw_action,
+                            False,
+                            torch.stack([torch.all(changed_actions == torch.tensor(action), dim=1) for action in utils.VALUES_ACTIONS])
+                        )
                         ni_counts = ni_masks.sum(dim = 1)
                         ni_means = torch.where(
                             ni_counts > 0,
@@ -301,6 +315,9 @@ class Agent:
         if self.passive_reward_bad_streak >= self.PASSIVE_REWARD_MAX_BAD_STREAK:
             is_state_too_bad = True
 
+        if self.no_nearby_fixed_points:
+            is_state_too_bad = True
+
         self.dbg_ht["receive_new_state"] += time.time() - tstart
 
         if is_state_too_bad:
@@ -322,23 +339,54 @@ class Agent:
         else:
             # the last state's scores against all fixed points:
             fp_scores = torch.exp(
-                (
-                    -torch.linalg.norm(self.states[-1][:3] - self.replays_states_actions[:, :3], dim=1) -
-                    q_fixed_points_helper.radian_distance_loss(self.states[-1][3:], self.replays_states_actions[:, 3:6])
-                ) / (self.fps_std**2 + 1e-10) + self.fps_amp
+                -torch.linalg.norm(self.states[-1][:3] - self.replays_states_actions[:, :3], dim=1)
+                / (self.fps_std**2 + 1e-10) + self.fps_amp
             )
 
             # we compute for each action the mean estimated q score.
-            temp = self.SOFTMAX_SCHEDULER.get(self.episode_ind) # we don't do softmax here, we just divide by sum(q_hat). temp is additive to any q_hat term.
+            temp = self.SOFTMAX_SCHEDULER.get(self.episode_ind)  # we don't do softmax here, we just divide by sum(q_hat). temp is additive to any q_hat term.
 
-            ni_counts = self.fps_masks.sum(dim=1)
-            q_hat = torch.where(ni_counts > 0, torch.where(self.fps_masks, fp_scores, torch.zeros_like(self.fps_masks)).sum(dim=1) / ni_counts + temp, 0.0)
+            # how does the perception of the agent's point change relative to the other points?
+            changed_actions, mask_throw_action = q_fixed_points_helper.cast_actions_by_yaw(
+                yaw = self.states[-1][self.rsa_ht["yaw"]],
+                target_yaws = self.replays_states_actions[:, self.rsa_ht["yaw"]],
+                target_actions = self.replays_states_actions[:, self.rsa_ht["steer"]: self.rsa_ht["steer"] + 3]
+            )
 
-            action_index = (q_hat / q_hat.sum()).multinomial(num_samples=1).item() if self.episode_ind % self.dbg_every != 0 else q_hat.argmax().item()
+            # TODO plot actions / changed actions..
+            torch.save(
+                {"state": self.states[-1][:3], "yaw": self.states[-1][self.rsa_ht["yaw"]], "fixed_states": self.replays_states_actions[:, :3],
+                 "target_actions": self.replays_states_actions[:, self.rsa_ht["steer"]: self.rsa_ht["steer"] + 3], "changed_actions": changed_actions},
+                f"../debug_logs/dbg_changed_actions_episode_{self.episode_ind}_{len(self.states)}.pt"
+            )
+
+            print(f"# fp actions before action cast: {torch.stack([torch.all(self.replays_states_actions[:, self.rsa_ht['steer']: self.rsa_ht['steer'] + 3] == torch.tensor(action), dim=1) for action in utils.VALUES_ACTIONS]).sum(dim=1)}", flush = True)
+            print(f"# fp actions after action cast: {torch.stack([torch.all(changed_actions == torch.tensor(action), dim=1) for action in utils.VALUES_ACTIONS]).sum(dim=1)}", flush = True)
+
+            # compute the masks against the perceived actions. remember to mask away the fixed points whose actions are at a too weird of an angle.
+            ni_masks = torch.where(
+                mask_throw_action,
+                False,
+                torch.stack([torch.all(changed_actions == torch.tensor(action), dim=1) for action in utils.VALUES_ACTIONS])
+            )
+
+            ni_counts = ni_masks.sum(dim=1)
+            q_hat = torch.where(
+                ni_counts > 0,
+                torch.where(ni_masks, fp_scores, 0.0).sum(dim=1) / ni_counts + temp,
+                0.0
+            )
+
+            if ni_counts.max().item() > 0:
+                action_index = (q_hat / q_hat.sum()).multinomial(num_samples=1).item() if self.episode_ind % self.dbg_every != 0 else q_hat.argmax().item()
+            else:
+                action_index = 1
+                self.no_nearby_fixed_points = True
+                print(f"No nearby fixed points!", flush = True)
+
             self.actions.append(utils.VALUES_ACTIONS[action_index])
 
             print(f"{self.episode_ind = }, {len(self.actions) = }, q_hat = {np.round(q_hat.numpy()[:3], 3)}, action distribution = {np.round((q_hat / q_hat.sum()).numpy()[:3], 3)}, {action_index = }")
-            # print(f"pre action index selection q_hat = {np.round(q_hat.numpy(), 3)}, {sum(ni_counts) = }", flush = True)
 
         # since we just computed the next action, we can also compute the reward given here as well.
         reward0 = 0
