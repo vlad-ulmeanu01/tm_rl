@@ -31,13 +31,14 @@ class Agent:
 
         self.BATCH_SIZE = 128
         self.Q_LR = 1e-2
-        self.LR = 1e-2 # 3e-3
+        self.LR = 5e-3 # 3e-3
         self.REPLAY_BUFSIZE = 3 * 10 ** 3
 
         self.POINTS_RADIUS = 30
         self.DISCOUNT_FACTOR = 0.99
 
-        self.SOFTMAX_SCHEDULER = utils.DecayScheduler(start=1e-2, end=0, decay=500) # temperature for the softmax policy. (10, 1, 500)
+        # self.SOFTMAX_SCHEDULER = utils.DecayScheduler(start=10, end=1, decay=500) # temperature for the softmax policy. (10, 1, 500) (1e-2, 0, 500)
+        self.EPS_GREEDY_SCHEDULER = utils.DecayScheduler(start=0.7, end=0.05, decay=1000)
         self.CNT_REPEATING_ACTIONS = utils.DecayScheduler(start=50, end=15, decay=1000)  # will choose a new action every CNT_REPEATING_ACTIONS.
 
         self.REWARD_END_EPISODE_COEF_START = 10.0
@@ -82,6 +83,7 @@ class Agent:
         self.replays_states_actions = np.vstack(self.replays_states_actions, dtype = np.float32)
 
         # stochastically map all steer values which aren't full left/right or center to one of those.
+        # also check against freewheeling / gas & brake, e.g. no gas & no brake.
         for i in range(len(self.replays_states_actions)):
             steer = self.replays_states_actions[i, self.rsa_ht["steer"]]
             if steer not in utils.VALUES_STEER:
@@ -90,16 +92,24 @@ class Agent:
                 steer = utils.VAL_STEER_RIGHT if random.random() < steer / utils.VAL_STEER_RIGHT else 0
                 self.replays_states_actions[i, self.rsa_ht["steer"]] = steer * sign
 
+            if self.replays_states_actions[i, self.rsa_ht["gas"]] == 0 and self.replays_states_actions[i, self.rsa_ht["brake"]] == 0:
+                self.replays_states_actions[i, self.rsa_ht["gas"]] = 1
+
+            if self.replays_states_actions[i, self.rsa_ht["gas"]] == 1 and self.replays_states_actions[i, self.rsa_ht["brake"]] == 1:
+                self.replays_states_actions[i, self.rsa_ht["brake"]] = 0
+
         self.replays_kdt = KDTree(self.replays_states_actions[:, [self.rsa_ht["x"], self.rsa_ht["y"], self.rsa_ht["z"]]])
         self.replays_states_actions = torch.from_numpy(self.replays_states_actions)
         self.reward2_visited = np.zeros(len(self.replays_states_actions), dtype = np.bool_)
 
         # remember for each fixed point's action its action index.
-        self.fps_action_indexes = np.array([utils.ACTION_INDEX_HT[tuple(action.tolist())] for action in self.replays_states_actions[:, self.rsa_ht["steer"]: self.rsa_ht["steer"] + 3]])
+        self.fps_action_indexes = np.array([utils.ACTION_INDEX_HT[tuple(action.int().tolist())] for action in self.replays_states_actions[:, self.rsa_ht["steer"]: self.rsa_ht["steer"] + 3]])
 
         # the model's parameters, each fixed point from self.replays_states_actions has an amplitude and a standard deviation.
-        self.fps_amp = torch.nn.Parameter(5 + torch.zeros(len(self.replays_states_actions)))
-        self.fps_std = torch.nn.Parameter(5 * torch.ones(len(self.replays_states_actions)))
+        self.fps_amp = torch.nn.Parameter(torch.zeros(len(self.replays_states_actions)))
+        self.fps_std = torch.nn.Parameter(torch.ones(3, len(self.replays_states_actions)))
+
+        self.optimizer = torch.optim.Adam(params = [self.fps_amp, self.fps_std], lr = self.LR)
 
         # debug metrics:
         self.dbg_tstart = time.time()
@@ -161,8 +171,10 @@ class Agent:
             ):
                 # we consider/normalize only by the count of points close enough to us.
                 fp_scores = torch.exp(
-                    -torch.linalg.norm(state[:3] - self.replays_states_actions[near_indexes, :3], dim=1)
-                    / (self.fps_std[near_indexes] + 1e-10) ** 2 + self.fps_amp[near_indexes]
+                    -torch.linalg.norm(state[:2] - self.replays_states_actions[near_indexes, :2], dim=1) ** 2 / (self.fps_std[0, near_indexes] + 1e-10) ** 2 +
+                    -torch.linalg.norm(state[1:3] - self.replays_states_actions[near_indexes, 1:3], dim=1) ** 2 / (self.fps_std[1, near_indexes] + 1e-10) ** 2 +
+                    -torch.linalg.norm(state[:3] - self.replays_states_actions[near_indexes, :3], dim=1) ** 2 / (self.fps_std[2, near_indexes] + 1e-10) ** 2 +
+                    self.fps_amp[near_indexes]
                 )
 
                 # how does the perception of the agent's point change relative to the other points?
@@ -181,8 +193,10 @@ class Agent:
                         q_target_candidate = (1 - self.Q_LR) * q_hat_candidate + self.Q_LR * reward if q_hat_candidate is not None else None
                     else:
                         fp_scores_next = torch.exp(
-                            -torch.linalg.norm(next_state[:3] - self.replays_states_actions[near_next_indexes, :3], dim=1)
-                            / (self.fps_std[near_next_indexes] + 1e-10) ** 2 + self.fps_amp[near_next_indexes]
+                            -torch.linalg.norm(next_state[:2] - self.replays_states_actions[near_next_indexes, :2], dim=1) ** 2 / (self.fps_std[0, near_next_indexes] + 1e-10) ** 2 +
+                            -torch.linalg.norm(next_state[1:3] - self.replays_states_actions[near_next_indexes, 1:3], dim=1) ** 2 / (self.fps_std[1, near_next_indexes] + 1e-10) ** 2 +
+                            -torch.linalg.norm(next_state[:3] - self.replays_states_actions[near_next_indexes, :3], dim=1) ** 2 / (self.fps_std[2, near_next_indexes] + 1e-10) ** 2 +
+                            self.fps_amp[near_next_indexes]
                         )
 
                         # how does the perception of the agent's point change relative to the other points?
@@ -215,17 +229,19 @@ class Agent:
 
             q_hat, q_target = torch.stack(q_hat), torch.stack(q_target)
 
-            if self.fps_amp.grad is not None: self.fps_amp.grad.zero_()
-            if self.fps_std.grad is not None: self.fps_std.grad.zero_()
+            # if self.fps_amp.grad is not None: self.fps_amp.grad.zero_()
+            # if self.fps_std.grad is not None: self.fps_std.grad.zero_()
+            self.optimizer.zero_grad()
 
             loss = F.smooth_l1_loss(q_hat, q_target)
             with torch.no_grad(): running_loss += loss.item()
 
             loss.backward()
 
-            with torch.no_grad():
-                self.fps_amp.sub_(self.fps_amp.grad, alpha = self.LR)
-                self.fps_std.sub_(self.fps_std.grad, alpha = self.LR)
+            # with torch.no_grad():
+            #     self.fps_amp.sub_(self.fps_amp.grad, alpha = self.LR)
+            #     self.fps_std.sub_(self.fps_std.grad, alpha = self.LR)
+            self.optimizer.step()
 
             loop_id += 1
 
@@ -240,6 +256,7 @@ class Agent:
     Called by the client to let us know that we passed a checkpoint.
     """
     def passed_checkpoint(self):
+        print(f"Checkpoint hit!", flush = True)
         self.rewards[-1] += utils.REWARD_COEF_PER_CHECKPOINT * (utils.MAX_TIME // utils.GAP_TIME - (len(self.states) - 1))
 
 
@@ -336,12 +353,15 @@ class Agent:
         else:
             # the last state's scores against all fixed points:
             fp_scores = torch.exp(
-                -torch.linalg.norm(self.states[-1][:3] - self.replays_states_actions[:, :3], dim=1)
-                / (self.fps_std**2 + 1e-10) + self.fps_amp
+                -torch.linalg.norm(self.states[-1][:2] - self.replays_states_actions[:, :2], dim=1) ** 2 / (self.fps_std[0]**2 + 1e-10) +
+                -torch.linalg.norm(self.states[-1][1:3] - self.replays_states_actions[:, 1:3], dim=1) ** 2 / (self.fps_std[1]**2 + 1e-10) +
+                -torch.linalg.norm(self.states[-1][:3] - self.replays_states_actions[:, :3], dim=1) ** 2 / (self.fps_std[2]**2 + 1e-10) +
+                self.fps_amp
             )
 
             # we compute for each action the mean estimated q score.
-            temp = self.SOFTMAX_SCHEDULER.get(self.episode_ind)  # we don't do softmax here, we just divide by sum(q_hat). temp is additive to any q_hat term.
+            # temp = self.SOFTMAX_SCHEDULER.get(self.episode_ind)  # we don't do softmax here, we just divide by sum(q_hat). temp is additive to any q_hat term.
+            eps_lim = self.EPS_GREEDY_SCHEDULER.get(self.episode_ind)
 
             # how does the perception of the agent's point change relative to the other points?
             changed_action_indexes, mask_throw_action = q_fixed_points_helper.cast_actions_by_yaw(
@@ -373,12 +393,18 @@ class Agent:
             ni_counts = ni_masks.sum(dim=1)
             q_hat = torch.where(
                 ni_counts > 0,
-                torch.where(ni_masks, fp_scores, 0.0).sum(dim=1) / ni_counts + temp,
-                0.0
+                torch.where(ni_masks, fp_scores, 0.0).sum(dim=1) / ni_counts,
+                -self.inf
             )
 
             if ni_counts.max().item() > 0:
-                action_index = (q_hat / q_hat.sum()).multinomial(num_samples=1).item() if self.episode_ind % self.dbg_every != 0 else q_hat.argmax().item()
+                # action_index = (q_hat / q_hat.sum()).multinomial(num_samples=1).item() if self.episode_ind % self.dbg_every != 0 else q_hat.argmax().item()
+                # action_index = F.softmax(q_hat / temp, dim = 0).multinomial(num_samples=1).item() if self.episode_ind % self.dbg_every != 0 else q_hat.argmax().item()
+
+                if random.random() < eps_lim and self.episode_ind % self.dbg_every != 0:
+                    action_index = np.arange(len(utils.VALUES_ACTIONS))[ni_counts > 0][random.randint(0, (ni_counts > 0).sum().item() - 1)]
+                else:
+                    action_index = q_hat.argmax().item()
             else:
                 action_index = 1
                 self.no_nearby_fixed_points = True
@@ -386,7 +412,8 @@ class Agent:
 
             self.actions.append(utils.VALUES_ACTIONS[action_index])
 
-            print(f"{self.episode_ind = }, {len(self.actions) = }, q_hat = {np.round(q_hat.numpy()[:3], 3)}, action distribution = {np.round((q_hat / q_hat.sum()).numpy()[:3], 3)}, {action_index = }")
+            # print(f"{self.episode_ind = }, {len(self.actions) = }, q_hat = {np.round(q_hat.numpy()[:3], 3)}, action distribution = {np.round((F.softmax(q_hat / temp, dim = 0)).numpy()[:3], 3)}, {action_index = }")
+            print(f"{self.episode_ind = }, {len(self.actions) = }, q_hat = {np.round(q_hat.numpy()[:3], 3)}, eps_lim = {round(eps_lim, 3)}, {action_index = }")
 
         # since we just computed the next action, we can also compute the reward given here as well.
         reward0 = 0

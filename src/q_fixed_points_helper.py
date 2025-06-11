@@ -19,7 +19,7 @@ def radian_distance_loss(u: torch.tensor, v: torch.tensor):
 def cast_actions_by_yaw(yaw: np.float32, target_yaws: np.array, target_action_indexes: np.array):
     # yaw increases trigonometrically. upright is 0, turning left increases, right decreases. -pi < yaw < pi.
     rad_distances = np.minimum(np.minimum(np.abs(yaw - target_yaws), np.abs(yaw - 2 * math.pi - target_yaws)), np.abs(yaw + 2 * math.pi - target_yaws))
-    mask_keep_action = rad_distances < math.pi / 4
+    mask_keep_action = rad_distances < math.pi / 6
     mask_throw_action = rad_distances > 3 * math.pi / 4
     mask_change_action = np.logical_and(mask_keep_action ^ True, mask_throw_action ^ True)
     mask_to_left = np.logical_and(

@@ -73,13 +73,14 @@ class MainClient(Client):
         if current < target:
             if current > 0:
                 self.agent.passed_checkpoint()
+                iface.prevent_simulation_finish()
             return
 
         iface.prevent_simulation_finish()
 
         t1 = time.time()
         self.agent.episode_ended(did_episode_end_normally = (target != -1))
-        print(f"Expensive function took {round(time.time() - t1, 3)}s.")
+        print(f"Expensive function took {round(time.time() - t1, 3)}s, {target = }.")
 
         self.agent.agent_wants_new_episode = False
 
