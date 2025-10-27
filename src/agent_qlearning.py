@@ -16,7 +16,7 @@ import utils
 class Agent:
     def __init__(self):
         self.states = []  # the states through which we have gone through during the current episode.
-        self.actions = ([], [], [])  # the actions that we have chosen during the episode.
+        self.actions = []  # the actions that we have chosen during the episode. TODO change to array of tuples before reusing.
         self.agent_wants_new_episode = False
 
         self.episode_ind = 1  # the id of the current episode. 1-indexed.
@@ -88,7 +88,7 @@ class Agent:
     """
     def clear_episode(self):
         self.states = []
-        self.actions = ([], [], [])
+        self.actions = []
         self.episode_ind += 1
         self.visited_replay_state.fill(-1)
 
@@ -98,23 +98,23 @@ class Agent:
     This should compute intermediate rewards and update the Q table.
     """
     def qlearn_update(self, did_episode_end_normally: bool):
-        # assert len(self.states) == len(self.actions[0]) + 1, f"{self.episode_ind = }, {len(self.states) = } != {len(self.actions[0]) + 1 = }."
+        # assert len(self.states) == len(self.actions) + 1, f"{self.episode_ind = }, {len(self.states) = } != {len(self.actions) + 1 = }."
 
-        _, indexes = self.kdt.query(self.states[: len(self.actions[0])-1], k = self.TOPK_CLOSEST)
+        _, indexes = self.kdt.query(self.states[: len(self.actions)-1], k = self.TOPK_CLOSEST)
 
-        for i in range(len(self.actions[0]) - 1):
+        for i in range(len(self.actions) - 1):
             for j in range(self.TOPK_CLOSEST):
                 if self.visited_replay_state[indexes[i, j]] == -1:
                     self.visited_replay_state[indexes[i, j]] = i
 
-        for i in range(len(self.actions[0]) - 1, -1, -1):
-            s, a = self.states[i], (self.actions[utils.IND_STEER][i], self.actions[utils.IND_GAS][i], self.actions[utils.IND_BRAKE][i])
+        for i in range(len(self.actions) - 1, -1, -1):
+            s, a = self.states[i], self.actions[i]
             if s not in self.q_table:
                 self.q_table[s] = {}
 
             q = self.q_table[s].get(a, 0.0)  # the current Q(s, a).
 
-            if i + 1 == len(self.actions[0]):
+            if i + 1 == len(self.actions):
                 # last_reward = 0 if did_episode_end_normally else self.REWARD_ON_FAIL  # all other rewards are -1 + REWARD_COEF * f(s,a).
                 last_reward = int(utils.MAX_TIME // utils.GAP_TIME) - (len(self.states) - 1) if did_episode_end_normally else 0
                 q = (1 - self.LR) * q + self.LR * last_reward  # Q(s, a) <- (1 - lr) * Q(s, a) + lr * last_reward
@@ -211,10 +211,9 @@ class Agent:
     The caller will access our internal self.actions list for further use.
     """
     def next_action(self):
-        if len(self.actions[0]) % self.CNT_REPEATING_ACTIONS:
+        if len(self.actions) % self.CNT_REPEATING_ACTIONS:
             # just copy the last action.
-            for ind in [utils.IND_STEER, utils.IND_GAS, utils.IND_BRAKE]:
-                self.actions[ind].append(self.actions[ind][-1])
+            self.actions.append(self.actions[-1])
         else:
             if (random.random() < self.EPSILON and self.episode_ind % self.dbg_every) or self.states[-1] not in self.q_table:
                 best_steer = random.choice(utils.VALUES_STEER)
@@ -228,6 +227,4 @@ class Agent:
                         best_action, best_q = action, q
                 best_steer, best_gas, best_brake = best_action
 
-            self.actions[utils.IND_STEER].append(best_steer)
-            self.actions[utils.IND_GAS].append(best_gas)
-            self.actions[utils.IND_BRAKE].append(best_brake)
+            self.actions.append((best_steer, best_gas, best_brake))

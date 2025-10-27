@@ -8,7 +8,8 @@ import copy
 import time
 import sys
 
-import agent_qnet
+# import agent_qnet_conv
+import agent_q_fixed_points
 import utils
 
 
@@ -16,7 +17,7 @@ class MainClient(Client):
     def __init__(self):
         super().__init__()
 
-        self.agent = agent_qnet.Agent()
+        self.agent = agent_q_fixed_points.Agent()
         self.remembered_state = None
 
     def on_registered(self, iface: TMInterface):
@@ -58,9 +59,9 @@ class MainClient(Client):
                 # we change the event buffer data to account for the new action.
                 iface.set_input_state(
                     sim_clear_buffer = True,
-                    steer = self.agent.actions[utils.IND_STEER][-1],
-                    accelerate = self.agent.actions[utils.IND_GAS][-1],
-                    brake = self.agent.actions[utils.IND_BRAKE][-1]
+                    steer = self.agent.actions[-1][utils.IND_STEER],
+                    accelerate = self.agent.actions[-1][utils.IND_GAS],
+                    brake = self.agent.actions[-1][utils.IND_BRAKE]
                 )
 
 
@@ -70,13 +71,16 @@ class MainClient(Client):
 
     def on_checkpoint_count_changed(self, iface: TMInterface, current: int, target: int):
         if current < target:
+            if current > 0:
+                self.agent.passed_checkpoint()
+                iface.prevent_simulation_finish()
             return
 
         iface.prevent_simulation_finish()
 
         t1 = time.time()
         self.agent.episode_ended(did_episode_end_normally = (target != -1))
-        print(f"Expensive function took {round(time.time() - t1, 3)}s.")
+        print(f"Expensive function took {round(time.time() - t1, 3)}s, {target = }.")
 
         self.agent.agent_wants_new_episode = False
 
